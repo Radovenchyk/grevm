@@ -199,7 +199,7 @@ fn erc20_batch_transfer() {
         final_txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Counter(1)),
+            ("grevm.parallel_round_calls", DebugValue::Counter(0)),
             ("grevm.conflict_tx_cnt", DebugValue::Counter(0)),
         ]
         .into_iter()

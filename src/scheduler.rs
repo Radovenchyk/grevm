@@ -634,7 +634,7 @@ where
                 }
                 // partition or repartition the txs
                 self.partition_transactions();
-                if self.num_partitions == 1 && force_sequential {
+                if self.num_partitions == 1 {
                     break;
                 }
 
