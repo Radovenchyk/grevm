@@ -9,20 +9,16 @@ pub mod erc20;
 #[path = "../tests/uniswap/mod.rs"]
 pub mod uniswap;
 
-use crate::erc20::erc20_contract::ERC20Token;
-use crate::uniswap::contract::SingleSwap;
+use crate::{erc20::erc20_contract::ERC20Token, uniswap::contract::SingleSwap};
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fastrace::collector::Config;
-use fastrace::prelude::*;
+use fastrace::{collector::Config, prelude::*};
 use fastrace_jaeger::JaegerReporter;
 use grevm::GrevmScheduler;
 use rand::Rng;
-use revm::primitives::alloy_primitives::U160;
-use revm::primitives::{Address, Env, SpecId, TransactTo, TxEnv, U256};
-use std::collections::HashMap;
-use std::sync::Arc;
+use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
+use std::{collections::HashMap, sync::Arc};
 
 const GIGA_GAS: u64 = 1_000_000_000;
 
@@ -34,15 +30,16 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     env.cfg.chain_id = NamedChain::Mainnet.into();
     env.block.coinbase = Address::from(U160::from(common::MINER_ADDRESS));
     let db = Arc::new(db);
+    let txs = Arc::new(txs);
 
-    let mut group = c.benchmark_group(name);
+    let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     group.bench_function("Origin Sequential", |b| {
         b.iter(|| {
             common::execute_revm_sequential(
                 black_box(db.clone()),
                 black_box(SpecId::LATEST),
                 black_box(env.clone()),
-                black_box(txs.clone()),
+                black_box(&*txs),
             )
         })
     });

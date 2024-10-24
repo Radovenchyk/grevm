@@ -3,23 +3,27 @@ use alloy_rpc_types::Block;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
-use grevm::{ExecuteOutput, GrevmError, GrevmScheduler};
-use revm::db::states::bundle_state::BundleRetention;
-use revm::db::states::StorageSlot;
-use revm::db::{BundleAccount, BundleState, PlainAccount};
-use revm::primitives::alloy_primitives::U160;
-use revm::primitives::{
-    uint, AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256,
-    KECCAK_EMPTY, U256,
+use grevm::{ExecuteOutput, GrevmScheduler};
+use revm::{
+    db::{
+        states::{bundle_state::BundleRetention, StorageSlot},
+        BundleAccount, BundleState, PlainAccount,
+    },
+    primitives::{
+        alloy_primitives::U160, uint, AccountInfo, Address, Bytecode, EVMError, Env,
+        ExecutionResult, SpecId, TxEnv, B256, KECCAK_EMPTY, U256,
+    },
+    DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder,
 };
-use revm::{DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Debug;
-use std::fs::{self, File};
-use std::io::BufReader;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    fs::{self, File},
+    io::BufReader,
+    sync::Arc,
+    time::Instant,
+};
 
 pub(crate) fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
@@ -109,17 +113,17 @@ pub(crate) fn compare_evm_execute<DB>(
     env.cfg.chain_id = NamedChain::Mainnet.into();
     env.block.coinbase = Address::from(U160::from(MINER_ADDRESS));
     let db = Arc::new(db);
+    let txs = Arc::new(txs);
     let start = Instant::now();
     let sequential = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
     let sequential_result = sequential.force_sequential_execute();
     println!("Grevm sequential execute time: {}ms", start.elapsed().as_millis());
 
-    let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
-    metrics::with_local_recorder(&recorder, || {
+    let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
         let parallel = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
         // set determined partitions
-        parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
+        let parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();
@@ -129,10 +133,11 @@ pub(crate) fn compare_evm_execute<DB>(
                 assert_eq!(*metric, value);
             }
         }
+        parallel_result
     });
 
     let start = Instant::now();
-    let reth_result = execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), txs.clone());
+    let reth_result = execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), &*txs);
     println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
 
     let mut max_gas_spent = 0;
@@ -172,7 +177,7 @@ pub(crate) fn execute_revm_sequential<DB>(
     db: DB,
     spec_id: SpecId,
     env: Env,
-    txs: Vec<TxEnv>,
+    txs: &[TxEnv],
 ) -> Result<ExecuteOutput, EVMError<DB::Error>>
 where
     DB: DatabaseRef,
@@ -188,7 +193,7 @@ where
 
     let mut results = Vec::with_capacity(txs.len());
     for tx in txs {
-        *evm.tx_mut() = tx;
+        *evm.tx_mut() = tx.clone();
         let result_and_state = evm.transact()?;
         evm.db_mut().commit(result_and_state.state);
         results.push(result_and_state.result);
