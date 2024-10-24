@@ -119,7 +119,7 @@ pub(crate) fn compare_evm_execute<DB>(
         let start = Instant::now();
         let parallel = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
         // set determined partitions
-        parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
+        parallel_result = parallel.force_parallel_execute(with_hints);
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();

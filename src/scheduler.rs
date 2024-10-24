@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Debug;
 use std::ops::DerefMut;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -231,6 +232,8 @@ where
 {
     /// Creates a new GrevmScheduler instance.
     pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Vec<TxEnv>) -> Self {
+        println!("Create new GrevmScheduler SpecId={:?}, txs.len()={:?}", spec_id, txs.len());
+
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
@@ -609,38 +612,41 @@ where
     #[fastrace::trace]
     fn evm_execute(
         &mut self,
-        force_sequential: Option<bool>,
-        with_hints: bool,
-        num_partitions: Option<usize>,
-    ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        if with_hints {
+        force_sequential: bool,
+        parse_hints_with_txs: bool,
+    ) -> Result<ExecuteOutput, GrevmError<DB::Error>>
+    where
+        <DB as DatabaseRef>::Error: Debug,
+    {
+        if parse_hints_with_txs {
             self.parse_hints();
-        }
-        if let Some(num_partitions) = num_partitions {
-            self.num_partitions = num_partitions;
         }
 
         self.metrics.total_tx_cnt.increment(self.txs.len() as u64);
-        let force_parallel = !force_sequential.unwrap_or(true); // adaptive false
-        let force_sequential = force_sequential.unwrap_or(false); // adaptive false
-
-        if self.txs.len() < self.num_partitions && !force_parallel {
-            self.execute_remaining_sequential()?;
-            return Ok(self.build_output());
-        }
 
         if !force_sequential {
             let mut round = 0;
             while round < MAX_NUM_ROUND {
-                if self.num_finality_txs < self.txs.len() {
-                    self.partition_transactions();
-                    if self.num_partitions == 1 && !force_parallel {
-                        break;
-                    }
-                    round += 1;
-                    self.round_execute()?;
-                } else {
+                if self.num_finality_txs >= self.txs.len() {
+                    assert_eq!(self.num_finality_txs, self.txs.len());
+                    info!("Round {:?} touch the finality!", round);
                     break;
+                }
+                // partition or repartition the txs
+                self.partition_transactions();
+                if self.num_partitions == 1 && force_sequential {
+                    break;
+                }
+
+                round += 1;
+                match self.round_execute() {
+                    Ok(_) => println!("Round {:?} execute success, self.num_finality_txs={:?}",
+                                      round, self.num_partitions),
+                    Err(err) => {
+                        info!("Round {:?} execute failed which error={:?}", round, err);
+                        // FIXME(gravity_richard): add more error code later
+                        panic!()
+                    },
                 }
             }
             self.metrics.parallel_tx_cnt.increment(self.num_finality_txs as u64);
@@ -655,21 +661,29 @@ where
     }
 
     /// Execute transactions in parallel.
-    pub fn parallel_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(None, true, None)
+    pub fn parallel_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>>
+    where
+        <DB as DatabaseRef>::Error: Debug,
+    {
+        self.evm_execute(false, true)
     }
 
     /// Execute transactions parallelly with or without hints.
     pub fn force_parallel_execute(
         mut self,
         with_hints: bool,
-        num_partitions: Option<usize>,
-    ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(Some(false), with_hints, num_partitions)
+    ) -> Result<ExecuteOutput, GrevmError<DB::Error>>
+    where
+        <DB as DatabaseRef>::Error: Debug,
+    {
+        self.evm_execute(false, with_hints)
     }
 
     /// Execute transactions sequentially.
-    pub fn force_sequential_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(Some(true), false, None)
+    pub fn force_sequential_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>>
+    where
+        <DB as DatabaseRef>::Error: Debug,
+    {
+        self.evm_execute(true, false)
     }
 }
