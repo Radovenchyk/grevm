@@ -16,8 +16,11 @@ use revm::primitives::{Address, EVMError, ExecutionResult, U256};
 use revm::TransitionAccount;
 use std::cmp::min;
 use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use revm::precompile::HashMap;
 use tokio::runtime::{Builder, Runtime};
 mod hint;
 mod partition;
@@ -156,20 +159,44 @@ where
     F: Fn(usize, usize, usize) + Send + Sync + 'scope,
 {
     let parallel_cnt = num_partitions.unwrap_or(*CPU_CORES * 2 + 1);
-    let index = AtomicUsize::new(0);
+    let partition_id = AtomicUsize::new(0);
     let remaining = num_elements % parallel_cnt;
     let chunk_size = num_elements / parallel_cnt;
     thread::scope(|scope| {
         for _ in 0..parallel_cnt {
             scope.spawn(|| {
-                let index = index.fetch_add(1, Ordering::SeqCst);
-                let start_pos = chunk_size * index + min(index, remaining);
+                let partition_id = partition_id.fetch_add(1, Ordering::SeqCst);
+                let start_pos = chunk_size * partition_id + min(partition_id, remaining);
                 let mut end_pos = start_pos + chunk_size;
-                if index < remaining {
+                if partition_id < remaining {
                     end_pos += 1;
                 }
-                f(start_pos, end_pos, index);
+                f(start_pos, end_pos, partition_id);
             });
         }
     });
+}
+
+#[test]
+fn test_fork_join_util() {
+    let num_elements: usize = 9008;
+    let num_partitions: usize = 10;
+    let groups: Arc<Mutex<HashMap<usize, (usize, usize)>>> = Arc::new(Mutex::new(HashMap::new()));
+    fork_join_util(num_elements, Some(num_partitions), |start_pos, end_pos, index| {
+        groups.lock().unwrap().insert(index, (start_pos, end_pos));
+    });
+
+    let target_group = HashMap::from([
+        (0, (0, 901)),
+        (1, (901, 1802)),
+        (2, (1802, 2703)),
+        (3, (2703, 3604)),
+        (4, (3604, 4505)),
+        (5, (4505, 5406)),
+        (6, (5406, 6307)),
+        (7, (6307, 7208)),
+        (8, (7208, 8108)),
+        (9, (8108, 9008)),
+    ]);
+    assert_eq!(*groups.lock().unwrap(), target_group);
 }

@@ -604,7 +604,7 @@ where
     fn parse_hints(&mut self) {
         let start = Instant::now();
         let hints = ParallelExecutionHints::new(self.tx_states.clone());
-        hints.parse_hints(self.txs.clone());
+        hints.parse_hints(&self.txs);
         self.tx_dependencies.init_tx_dependency(self.tx_states.clone());
         self.metrics.parse_hints_time.increment(start.elapsed().as_nanos() as u64);
     }

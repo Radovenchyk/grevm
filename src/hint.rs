@@ -94,15 +94,15 @@ impl ParallelExecutionHints {
     /// However, this would introduce locking overhead and impact performance.
     /// The primary consideration is that developers are aware there are no conflicts between transactions, making the `Mutex` approach unnecessarily verbose and cumbersome.
     #[fastrace::trace]
-    pub(crate) fn parse_hints(&self, txs: Arc<Vec<TxEnv>>) {
+    pub(crate) fn parse_hints(&self, txs: &Arc<Vec<TxEnv>>) {
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
             #[allow(invalid_reference_casting)]
             let hints =
                 unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
-            for index in start_tx..end_tx {
-                let tx_env = &txs[index];
-                let rw_set = &mut hints[index];
+            for tx_index in start_tx..end_tx {
+                let tx_env = &txs[tx_index];
+                let rw_set = &mut hints[tx_index];
                 // Insert caller's basic location into read-write set
                 rw_set.insert_location(LocationAndType::Basic(tx_env.caller), RWType::ReadWrite);
                 if let TxKind::Call(to_address) = tx_env.transact_to {
