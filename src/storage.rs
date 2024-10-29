@@ -224,7 +224,7 @@ fn load_storage<DB: DatabaseRef>(
                     let value = if is_storage_known {
                         U256::ZERO
                     } else {
-                        tokio::task::block_in_place(|| database.storage_ref(address, index))?
+                        database.storage_ref(address, index)?
                     };
                     entry.insert(value);
                     Ok(value)
@@ -431,9 +431,9 @@ impl<DB> PartitionDB<DB> {
                         read_account.account.as_ref().map_or(true, |read_account| {
                             new_contract_account =
                                 has_code && read_account.info.is_empty_code_hash();
-                            new_contract_account ||
-                                read_account.info.nonce != account.info.nonce ||
-                                read_account.info.balance != account.info.balance
+                            new_contract_account
+                                || read_account.info.nonce != account.info.nonce
+                                || read_account.info.balance != account.info.balance
                         })
                     }
                     None => {
@@ -532,7 +532,9 @@ where
                     Ok(entry.insert(account.clone()).account_info())
                 } else {
                     // 3. read from origin database
-                    tokio::task::block_in_place(|| self.scheduler_db.database.basic_ref(address))
+                    self.scheduler_db
+                        .database
+                        .basic_ref(address)
                         .map(|info| entry.insert(into_cache_account(info)).account_info())
                 }
             }
@@ -564,9 +566,7 @@ where
                 }
 
                 // 3. read from origin database
-                let code = tokio::task::block_in_place(|| {
-                    self.scheduler_db.database.code_by_hash_ref(code_hash)
-                })?;
+                let code = self.scheduler_db.database.code_by_hash_ref(code_hash)?;
                 entry.insert(code.clone());
                 return Ok(code);
             }
@@ -591,9 +591,7 @@ where
             btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
             btree_map::Entry::Vacant(entry) => {
                 // TODO(gravity_nekomoto): read from scheduler_db?
-                let ret = *entry.insert(tokio::task::block_in_place(|| {
-                    self.scheduler_db.database.block_hash_ref(number)
-                })?);
+                let ret = *entry.insert(self.scheduler_db.database.block_hash_ref(number)?);
 
                 // prune all hashes that are older then BLOCK_HASH_HISTORY
                 let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
