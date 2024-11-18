@@ -192,11 +192,7 @@ where
     DB: DatabaseRef,
     DB::Error: Debug,
 {
-    let db = StateBuilder::new()
-        .with_bundle_update()
-        .without_state_clear()
-        .with_database_ref(db)
-        .build();
+    let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let mut evm =
         EvmBuilder::default().with_db(db).with_spec_id(spec_id).with_env(Box::new(env)).build();
 

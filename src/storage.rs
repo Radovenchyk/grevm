@@ -186,7 +186,9 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            cache: CacheState::new(false),
+            // TODO(gravity): Set state clear flag if the block is after the Spurious Dragon
+            // hardfork.
+            cache: CacheState::default(),
             transition_state: Some(TransitionState::default()),
             bundle_state: BundleState::default(),
             block_hashes: BTreeMap::new(),
@@ -468,7 +470,7 @@ impl<DB> PartitionDB<DB> {
     pub(crate) fn new(coinbase: Address, scheduler_db: Arc<SchedulerDB<DB>>) -> Self {
         Self {
             coinbase,
-            cache: CacheState::new(false),
+            cache: CacheState::new(scheduler_db.state.cache.has_state_clear),
             scheduler_db,
             block_hashes: BTreeMap::new(),
             tx_read_set: AHashMap::new(),
