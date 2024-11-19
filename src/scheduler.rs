@@ -208,7 +208,7 @@ pub fn new_grevm_scheduler<DB>(
     spec_id: SpecId,
     env: Env,
     db: DB,
-    txs: Vec<TxEnv>,
+    txs: Arc<Vec<TxEnv>>,
     state: Option<Box<State>>,
 ) -> GrevmScheduler<DatabaseWrapper<DB::Error>>
 where
@@ -226,7 +226,7 @@ where
         >(boxed)
     };
     let db: DatabaseWrapper<DB::Error> = DatabaseWrapper(db);
-    GrevmScheduler::new(spec_id, env, db, Arc::new(txs), state)
+    GrevmScheduler::new(spec_id, env, db, txs, state)
 }
 
 impl<DB> GrevmScheduler<DB>
@@ -330,8 +330,8 @@ where
         let mut merged_write_set: HashMap<LocationAndType, BTreeSet<TxId>> = HashMap::new();
         let mut end_skip_id = self.num_finality_txs;
         for txid in self.num_finality_txs..self.tx_states.len() {
-            if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation &&
-                end_skip_id == txid
+            if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation
+                && end_skip_id == txid
             {
                 end_skip_id += 1;
             } else {
@@ -411,10 +411,10 @@ where
                             if let Some(previous_txid) = written_txs.range(..txid).next_back() {
                                 // update dependencies: previous_txid <- txid
                                 updated_dependencies.insert(*previous_txid);
-                                if !conflict &&
-                                    (!executor.assigned_txs.binary_search(previous_txid).is_ok() ||
-                                        tx_states[*previous_txid].tx_status ==
-                                            TransactionStatus::Conflict)
+                                if !conflict
+                                    && (!executor.assigned_txs.binary_search(previous_txid).is_ok()
+                                        || tx_states[*previous_txid].tx_status
+                                            == TransactionStatus::Conflict)
                                 {
                                     conflict = true;
                                 }
@@ -443,8 +443,8 @@ where
             self.metrics.reusable_tx_cnt.increment(executor.metrics.reusable_tx_cnt);
             min_execute_time = min_execute_time.min(executor.metrics.execute_time);
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
-            if executor.assigned_txs[0] == self.num_finality_txs &&
-                self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict
+            if executor.assigned_txs[0] == self.num_finality_txs
+                && self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict
             {
                 return Err(GrevmError::EvmError(
                     executor.error_txs.remove(&self.num_finality_txs).unwrap(),

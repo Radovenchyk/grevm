@@ -158,7 +158,7 @@ impl ParallelBundleState for BundleState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     /// Cache the committed data of finality txns and the read-only data during execution after
     /// each round of execution. Used as the initial state for the next round of partition
