@@ -43,14 +43,17 @@ impl DatabaseRef for InMemoryDB {
         if self.latency_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(self.latency_us));
         }
-        self.bytecodes.get(&code_hash).cloned().ok_or(String::from("can't find code by hash"))
+        self.bytecodes
+            .get(&code_hash)
+            .cloned()
+            .ok_or(String::from(format!("can't find code by hash {code_hash}")))
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         if self.latency_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(self.latency_us));
         }
-        let storage = self.accounts.get(&address).ok_or("can't find account")?;
+        let storage = self.accounts.get(&address).ok_or(format!("can't find account {address}"))?;
         Ok(storage.storage.get(&index).cloned().unwrap_or_default())
     }
 
