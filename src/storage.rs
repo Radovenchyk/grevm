@@ -158,6 +158,10 @@ impl ParallelBundleState for BundleState {
     }
 }
 
+/// State of blockchain.
+///
+/// State clear flag is set inside CacheState and by default it is enabled.
+/// If you want to disable it use `set_state_clear_flag` function.
 #[derive(Debug, Clone)]
 pub struct State {
     /// Cache the committed data of finality txns and the read-only data during execution after
