@@ -8,7 +8,8 @@ use std::{
 pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
+use tracing::info;
 
 const RAW_TRANSFER_WEIGHT: usize = 1;
 
@@ -33,6 +34,7 @@ pub(crate) struct TxDependency {
     tx_weight: Option<Vec<usize>>,
 
     pub round: Option<usize>,
+    pub block_height: u64,
 }
 
 impl TxDependency {
@@ -43,6 +45,7 @@ impl TxDependency {
             tx_running_time: None,
             tx_weight: None,
             round: None,
+            block_height: 0,
         }
     }
 
@@ -210,6 +213,25 @@ impl TxDependency {
         self.num_finality_txs = num_finality_txs;
     }
 
+    fn draw_dependent_graph(&self) {
+        let num_finality_txs = self.num_finality_txs;
+        for (index, dep) in self.tx_dependency.iter().enumerate() {
+            let txid = index + num_finality_txs;
+            let round = self.round.map(|r| format!("round{}", r)).unwrap_or(String::from("none"));
+            gauge!("node_status",
+                "id" => format!("tx{}", txid), "status" => "healthy",
+                "round" => round.clone(), "block_height" => format!("{}", self.block_height))
+            .set(1.0);
+            let dep: BTreeSet<TxId> = dep.clone().into_iter().collect();
+            for dep_id in dep {
+                gauge!("edge_flow",
+                    "source" => format!("tx{}", txid), "target" => format!("tx{}", dep_id),
+                    "round" => round.clone(), "block_height" => format!("{}", self.block_height))
+                .set(1.0);
+            }
+        }
+    }
+
     fn skew_analyze(&self, weighted_group: &BTreeMap<usize, Vec<DependentTxsVec>>) {
         if !(*DEBUG_BOTTLENECK) {
             return;
@@ -236,6 +258,7 @@ impl TxDependency {
         if num_txs < 64 || num_remaining < num_txs / 3 || subgraph.is_empty() {
             return;
         }
+        self.draw_dependent_graph();
 
         // ChainLength -> ChainNumber
         let mut chains = BTreeMap::new();
@@ -266,16 +289,18 @@ impl TxDependency {
         counter!("grevm.large_graph_block_cnt", "tip" => tip.clone()).increment(1);
         if let Some((chain_len, _)) = chains.last_key_value() {
             let chain_len = *chain_len;
-            if chain_len > graph_len * 2 / 3 {
+            let chain_type = if chain_len > graph_len * 2 / 3 {
                 // Long chain
-                counter!("grevm.large_graph", "type" => "chain", "tip" => tip.clone()).increment(1);
+                "chain"
             } else if chain_len < max(3, graph_len / 6) {
                 // Star Graph
-                counter!("grevm.large_graph", "type" => "star", "tip" => tip.clone()).increment(1);
+                "star"
             } else {
                 // Fork Graph
-                counter!("grevm.large_graph", "type" => "fork", "tip" => tip.clone()).increment(1);
-            }
+                "fork"
+            };
+            counter!("grevm.large_graph", "type" => chain_type, "tip" => tip.clone()).increment(1);
+            info!("Block({}) has large subgraph, type={}", self.block_height, chain_type);
         }
     }
 }

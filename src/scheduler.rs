@@ -767,6 +767,7 @@ where
             self.spec_id
         );
         self.metrics.block_height = block_height;
+        self.tx_dependencies.block_height = block_height;
         if with_hints {
             self.parse_hints();
         }
