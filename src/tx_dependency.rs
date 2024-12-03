@@ -1,14 +1,14 @@
+use crate::{fork_join_util, LocationAndType, SharedTxStates, TxId, DEBUG_BOTTLENECK};
 use smallvec::SmallVec;
 use std::{
-    cmp::{min, Reverse},
+    cmp::{max, min, Reverse},
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
 };
 
-use crate::{fork_join_util, LocationAndType, SharedTxStates, TxId};
-
 pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
 
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use metrics::counter;
 
 const RAW_TRANSFER_WEIGHT: usize = 1;
 
@@ -31,6 +31,8 @@ pub(crate) struct TxDependency {
     // type, while in the second round, weights can be assigned based on tx_running_time.
     #[allow(dead_code)]
     tx_weight: Option<Vec<usize>>,
+
+    pub round: Option<usize>,
 }
 
 impl TxDependency {
@@ -40,6 +42,7 @@ impl TxDependency {
             num_finality_txs: 0,
             tx_running_time: None,
             tx_weight: None,
+            round: None,
         }
     }
 
@@ -47,12 +50,13 @@ impl TxDependency {
     pub fn init_tx_dependency(&mut self, tx_states: SharedTxStates) {
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         for (txid, rw_set) in tx_states.iter().enumerate() {
-            let dependencies = &mut self.tx_dependency[txid];
+            let mut dependencies = HashSet::new();
             for (location, _) in rw_set.read_set.iter() {
                 if let Some(previous) = last_write_tx.get(location) {
-                    dependencies.push(*previous);
+                    dependencies.insert(*previous);
                 }
             }
+            self.tx_dependency[txid] = dependencies.into_iter().collect();
             for location in rw_set.write_set.iter() {
                 last_write_tx.insert(location.clone(), txid);
             }
@@ -139,6 +143,7 @@ impl TxDependency {
             }
             txid -= 1;
         }
+        self.skew_analyze(&weighted_group);
 
         let num_partitions = min(partition_count, num_group);
         if num_partitions == 0 {
@@ -203,5 +208,70 @@ impl TxDependency {
         }
         self.tx_dependency = tx_dependency;
         self.num_finality_txs = num_finality_txs;
+    }
+
+    fn skew_analyze(&self, weighted_group: &BTreeMap<usize, Vec<DependentTxsVec>>) {
+        if !(*DEBUG_BOTTLENECK) {
+            return;
+        }
+        if let Some(0) = self.round {
+            counter!("grevm.total_block_cnt").increment(1);
+        }
+        let num_finality_txs = self.num_finality_txs;
+        let num_txs = num_finality_txs + self.tx_dependency.len();
+        let num_remaining = self.tx_dependency.len();
+        if num_txs < 64 || num_remaining < num_txs / 3 {
+            return;
+        }
+        let mut subgraph = BTreeSet::new();
+        if let Some((_, groups)) = weighted_group.last_key_value() {
+            if groups[0].len() >= num_remaining / 3 {
+                subgraph.extend(groups[0].clone());
+            }
+        }
+        if subgraph.is_empty() {
+            return;
+        }
+
+        // ChainLength -> ChainNumber
+        let mut chains = BTreeMap::new();
+        let mut visited = HashSet::new();
+        for txid in subgraph.iter().rev() {
+            if !visited.contains(txid) {
+                let mut txid = *txid;
+                let mut chain_len = 0;
+                while !visited.contains(&txid) {
+                    chain_len += 1;
+                    visited.insert(txid);
+                    let dep: BTreeSet<TxId> =
+                        self.tx_dependency[txid - num_finality_txs].clone().into_iter().collect();
+                    for dep_id in dep.into_iter().rev() {
+                        if !visited.contains(&dep_id) {
+                            txid = dep_id;
+                            break;
+                        }
+                    }
+                }
+                let chain_num = chains.get(&chain_len).cloned().unwrap_or(0) + 1;
+                chains.insert(chain_len, chain_num);
+            }
+        }
+
+        let graph_len = subgraph.len();
+        let tip = self.round.map(|r| format!("round{}", r)).unwrap_or(String::from("none"));
+        counter!("grevm.large_graph_block_cnt", "tip" => tip.clone()).increment(1);
+        if let Some((chain_len, _)) = chains.last_key_value() {
+            let chain_len = *chain_len;
+            if chain_len > graph_len * 2 / 3 {
+                // Long chain
+                counter!("grevm.large_graph", "type" => "chain", "tip" => tip.clone()).increment(1);
+            } else if chain_len < max(3, graph_len / 8) {
+                // Star Graph
+                counter!("grevm.large_graph", "type" => "star", "tip" => tip.clone()).increment(1);
+            } else {
+                // Fork Graph
+                counter!("grevm.large_graph", "type" => "fork", "tip" => tip.clone()).increment(1);
+            }
+        }
     }
 }

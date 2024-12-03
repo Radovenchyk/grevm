@@ -5,7 +5,7 @@ use crate::{
     storage::{SchedulerDB, State},
     tx_dependency::{DependentTxsVec, TxDependency},
     GrevmError, LocationAndType, ResultAndTransition, TransactionStatus, TxId, CPU_CORES,
-    GREVM_RUNTIME, MAX_NUM_ROUND,
+    DEBUG_BOTTLENECK, GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use atomic::Atomic;
@@ -75,6 +75,10 @@ struct ExecuteMetrics {
     commit_transition_time: metrics::Histogram,
     /// Time taken to execute transactions in sequential(in nanoseconds).
     sequential_execute_time: metrics::Histogram,
+    /// Number of transactions that failed to parse contract
+    unknown_contract_tx_cnt: metrics::Histogram,
+    /// Number of raw transactions
+    raw_tx_cnt: metrics::Histogram,
 }
 
 impl Default for ExecuteMetrics {
@@ -100,6 +104,8 @@ impl Default for ExecuteMetrics {
             merge_write_set_time: histogram!("grevm.merge_write_set_time"),
             commit_transition_time: histogram!("grevm.commit_transition_time"),
             sequential_execute_time: histogram!("grevm.sequential_execute_time"),
+            unknown_contract_tx_cnt: histogram!("grevm.unknown_contract_tx_cnt"),
+            raw_tx_cnt: histogram!("grevm.raw_tx_cnt"),
         }
     }
 }
@@ -127,6 +133,8 @@ struct ExecuteMetricsCollector {
     merge_write_set_time: u64,
     commit_transition_time: u64,
     sequential_execute_time: u64,
+    unknown_contract_tx_cnt: u64,
+    raw_tx_cnt: u64,
 }
 
 impl ExecuteMetricsCollector {
@@ -152,6 +160,8 @@ impl ExecuteMetricsCollector {
         execute_metrics.merge_write_set_time.record(self.merge_write_set_time as f64);
         execute_metrics.commit_transition_time.record(self.commit_transition_time as f64);
         execute_metrics.sequential_execute_time.record(self.sequential_execute_time as f64);
+        execute_metrics.unknown_contract_tx_cnt.record(self.unknown_contract_tx_cnt as f64);
+        execute_metrics.raw_tx_cnt.record(self.raw_tx_cnt as f64);
     }
 }
 
@@ -348,9 +358,10 @@ where
 
     /// Get the partitioned transactions by dependencies.
     #[fastrace::trace]
-    pub(crate) fn partition_transactions(&mut self) {
+    pub(crate) fn partition_transactions(&mut self, round: usize) {
         // compute and assign partitioned_txs
         let start = Instant::now();
+        self.tx_dependencies.round = Some(round);
         self.partitioned_txs = self.tx_dependencies.fetch_best_partitions(self.num_partitions);
         self.num_partitions = self.partitioned_txs.len();
         let mut max = 0;
@@ -412,13 +423,15 @@ where
         let start = Instant::now();
         let mut merged_write_set: HashMap<LocationAndType, BTreeSet<TxId>> = HashMap::new();
         let mut end_skip_id = self.num_finality_txs;
-        for txid in self.num_finality_txs..self.tx_states.len() {
-            if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation &&
-                end_skip_id == txid
-            {
-                end_skip_id += 1;
-            } else {
-                break;
+        if !(*DEBUG_BOTTLENECK) {
+            for txid in self.num_finality_txs..self.tx_states.len() {
+                if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation &&
+                    end_skip_id == txid
+                {
+                    end_skip_id += 1;
+                } else {
+                    break;
+                }
             }
         }
         if end_skip_id != self.tx_states.len() {
@@ -438,8 +451,7 @@ where
     /// and there is no need to record the dependency and dependent relationships of these
     /// transactions. Thus achieving the purpose of pruning.
     #[fastrace::trace]
-    fn update_and_pruning_dependency(&mut self) {
-        let num_finality_txs = self.num_finality_txs;
+    fn update_and_pruning_dependency(&mut self, num_finality_txs: usize) {
         if num_finality_txs == self.txs.len() {
             return;
         }
@@ -524,6 +536,13 @@ where
                 }
             }
         });
+        if *DEBUG_BOTTLENECK && self.num_finality_txs == 0 {
+            // Use the read-write set to build accurate dependencies,
+            // and try to find the bottleneck
+            self.update_and_pruning_dependency(0);
+            self.tx_dependencies.round = None;
+            self.tx_dependencies.fetch_best_partitions(self.num_partitions);
+        }
         miner_involved_txs.into_iter().collect()
     }
 
@@ -651,7 +670,7 @@ where
         let miner_involved_txs = self.generate_unconfirmed_txs();
         let finality_tx_cnt = self.find_continuous_min_txid()?;
         // update and pruning tx dependencies
-        self.update_and_pruning_dependency();
+        self.update_and_pruning_dependency(self.num_finality_txs);
         self.commit_transition(finality_tx_cnt)?;
         let mut rewards_accumulators = RewardsAccumulators::new();
         for txid in miner_involved_txs {
@@ -721,10 +740,12 @@ where
     #[fastrace::trace]
     fn parse_hints(&mut self) {
         let start = Instant::now();
-        let hints = ParallelExecutionHints::new(self.tx_states.clone());
+        let mut hints = ParallelExecutionHints::new(self.tx_states.clone());
         hints.parse_hints(self.txs.clone());
         self.tx_dependencies.init_tx_dependency(self.tx_states.clone());
         self.metrics.parse_hints_time += start.elapsed().as_nanos() as u64;
+        self.metrics.unknown_contract_tx_cnt += hints.unknown_contract_tx_cnt;
+        self.metrics.raw_tx_cnt += hints.raw_tx_cnt;
     }
 
     #[fastrace::trace]
@@ -754,7 +775,7 @@ where
             let mut round = 0;
             while round < MAX_NUM_ROUND {
                 if self.num_finality_txs < self.txs.len() {
-                    self.partition_transactions();
+                    self.partition_transactions(round);
                     if self.num_partitions == 1 && !force_parallel {
                         break;
                     }
