@@ -11,8 +11,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use atomic::Atomic;
 use dashmap::DashSet;
 use fastrace::Span;
-use lazy_static::lazy_static;
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use revm::{
     primitives::{
         AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256, U256,
@@ -32,6 +31,7 @@ use tokio::sync::Notify;
 use tracing::info;
 
 struct ExecuteMetrics {
+    block_height: metrics::Counter,
     /// Number of times parallel execution is called.
     parallel_execute_calls: metrics::Gauge,
     /// Number of times sequential execution is called.
@@ -84,6 +84,7 @@ struct ExecuteMetrics {
 impl Default for ExecuteMetrics {
     fn default() -> Self {
         Self {
+            block_height: counter!("grevm.block_height"),
             parallel_execute_calls: gauge!("grevm.parallel_round_calls"),
             sequential_execute_calls: gauge!("grevm.sequential_execute_calls"),
             total_tx_cnt: histogram!("grevm.total_tx_cnt"),
@@ -113,6 +114,7 @@ impl Default for ExecuteMetrics {
 /// Collect metrics and report
 #[derive(Default)]
 struct ExecuteMetricsCollector {
+    block_height: u64,
     parallel_execute_calls: u64,
     sequential_execute_calls: u64,
     total_tx_cnt: u64,
@@ -140,6 +142,7 @@ struct ExecuteMetricsCollector {
 impl ExecuteMetricsCollector {
     fn report(&self) {
         let execute_metrics = ExecuteMetrics::default();
+        execute_metrics.block_height.absolute(self.block_height);
         execute_metrics.parallel_execute_calls.set(self.parallel_execute_calls as f64);
         execute_metrics.sequential_execute_calls.set(self.sequential_execute_calls as f64);
         execute_metrics.total_tx_cnt.record(self.total_tx_cnt as f64);
@@ -337,7 +340,6 @@ where
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
-        info!("Parallel execute {} txs of SpecId {:?}", num_txs, spec_id);
         Self {
             spec_id,
             env,
@@ -550,12 +552,12 @@ where
     /// If the smallest TxID is a conflict transaction, return an error.
     #[fastrace::trace]
     fn find_continuous_min_txid(&mut self) -> Result<usize, GrevmError<DB::Error>> {
-        let mut min_execute_time = Duration::from_secs(u64::MAX);
+        let mut sum_execute_time = Duration::from_secs(0);
         let mut max_execute_time = Duration::from_secs(0);
         for executor in &self.partition_executors {
             let mut executor = executor.write().unwrap();
             self.metrics.reusable_tx_cnt += executor.metrics.reusable_tx_cnt;
-            min_execute_time = min_execute_time.min(executor.metrics.execute_time);
+            sum_execute_time += executor.metrics.execute_time;
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
             if executor.assigned_txs[0] == self.num_finality_txs &&
                 self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict
@@ -568,7 +570,9 @@ where
         let mut conflict_tx_cnt = 0;
         let mut unconfirmed_tx_cnt = 0;
         let mut finality_tx_cnt = 0;
-        self.metrics.partition_et_diff += (max_execute_time - min_execute_time).as_nanos() as u64;
+        let avg_execution_time =
+            sum_execute_time.as_nanos() / self.partition_executors.len() as u128;
+        self.metrics.partition_et_diff += (max_execute_time.as_nanos() - avg_execution_time) as u64;
         #[allow(invalid_reference_casting)]
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
@@ -755,6 +759,14 @@ where
         with_hints: bool,
         num_partitions: Option<usize>,
     ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
+        let block_height: u64 = self.env.block.number.try_into().unwrap_or(0);
+        info!(
+            "Parallel execute {} txs: block={}, SpecId={:?}",
+            self.txs.len(),
+            block_height,
+            self.spec_id
+        );
+        self.metrics.block_height = block_height;
         if with_hints {
             self.parse_hints();
         }

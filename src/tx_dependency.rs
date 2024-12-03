@@ -8,7 +8,7 @@ use std::{
 pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use metrics::counter;
+use metrics::{counter, histogram};
 
 const RAW_TRANSFER_WEIGHT: usize = 1;
 
@@ -214,22 +214,26 @@ impl TxDependency {
         if !(*DEBUG_BOTTLENECK) {
             return;
         }
-        if let Some(0) = self.round {
-            counter!("grevm.total_block_cnt").increment(1);
-        }
         let num_finality_txs = self.num_finality_txs;
         let num_txs = num_finality_txs + self.tx_dependency.len();
         let num_remaining = self.tx_dependency.len();
-        if num_txs < 64 || num_remaining < num_txs / 3 {
-            return;
+        if let Some(0) = self.round {
+            counter!("grevm.total_block_cnt").increment(1);
         }
         let mut subgraph = BTreeSet::new();
         if let Some((_, groups)) = weighted_group.last_key_value() {
+            if self.round.is_none() {
+                let largest_ratio = groups[0].len() as f64 / num_remaining as f64;
+                histogram!("grevm.large_graph_ratio").record(largest_ratio);
+                if groups[0].len() >= num_remaining / 2 {
+                    counter!("grevm.low_parallelism_cnt").increment(1);
+                }
+            }
             if groups[0].len() >= num_remaining / 3 {
                 subgraph.extend(groups[0].clone());
             }
         }
-        if subgraph.is_empty() {
+        if num_txs < 64 || num_remaining < num_txs / 3 || subgraph.is_empty() {
             return;
         }
 
@@ -265,7 +269,7 @@ impl TxDependency {
             if chain_len > graph_len * 2 / 3 {
                 // Long chain
                 counter!("grevm.large_graph", "type" => "chain", "tip" => tip.clone()).increment(1);
-            } else if chain_len < max(3, graph_len / 8) {
+            } else if chain_len < max(3, graph_len / 6) {
                 // Star Graph
                 counter!("grevm.large_graph", "type" => "star", "tip" => tip.clone()).increment(1);
             } else {
