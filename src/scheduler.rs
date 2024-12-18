@@ -1,6 +1,7 @@
 use crate::{
+    async_commit::AsyncCommit,
     hint::ParallelExecutionHints,
-    storage::{CacheDB, SharedCacheData},
+    storage::{CacheDB, CachedStorageData},
     tx_dependency::TxDependency,
     LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
     TxState, TxVersion, CONCURRENT_LEVEL,
@@ -9,12 +10,12 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
 use revm::{Evm, EvmBuilder};
-use revm_primitives::{db::DatabaseRef, EVMError, EVMResult, Env, SpecId, TxEnv, TxKind};
+use revm_primitives::{db::DatabaseRef, EVMError, Env, SpecId, TxEnv, TxKind};
 use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
 };
@@ -26,15 +27,18 @@ pub trait RewardsAccumulator {
     fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128>;
 }
 
-pub struct Scheduler<DB>
+pub struct Scheduler<DB, C>
 where
     DB: DatabaseRef,
+    C: AsyncCommit,
 {
     spec_id: SpecId,
     env: Env,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
     db: DB,
+    commiter: C,
+    cache: CachedStorageData,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
     tx_dependency: Mutex<TxDependency>,
@@ -48,9 +52,10 @@ where
     abort: AtomicBool,
 }
 
-impl<DB> RewardsAccumulator for Scheduler<DB>
+impl<DB, C> RewardsAccumulator for Scheduler<DB, C>
 where
     DB: DatabaseRef,
+    C: AsyncCommit,
 {
     fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128> {
         // register miner accumulator
@@ -74,12 +79,20 @@ where
     }
 }
 
-impl<DB> Scheduler<DB>
+impl<DB, C> Scheduler<DB, C>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync,
+    C: AsyncCommit + Send + Sync,
 {
-    pub fn new(spec_id: SpecId, env: Env, txs: Arc<Vec<TxEnv>>, db: DB, with_hints: bool) -> Self {
+    pub fn new(
+        spec_id: SpecId,
+        env: Env,
+        txs: Arc<Vec<TxEnv>>,
+        db: DB,
+        commiter: C,
+        with_hints: bool,
+    ) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
             ParallelExecutionHints::new(txs.clone()).parse_hints()
@@ -92,6 +105,8 @@ where
             block_size: num_txs,
             txs,
             db,
+            commiter,
+            cache: CachedStorageData::new(),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
             tx_dependency: Mutex::new(tx_dependency),
@@ -103,21 +118,52 @@ where
         }
     }
 
+    fn async_commit(&self, commit_notifier: &(Mutex<bool>, Condvar)) {
+        let mut num_commit = 0;
+        while !self.abort.load(Ordering::Acquire) && num_commit < self.block_size {
+            {
+                let mut ready = commit_notifier.0.lock().unwrap();
+                while !*ready {
+                    ready = commit_notifier.1.wait(ready).unwrap();
+                }
+            }
+            while num_commit < self.finality_idx.load(Ordering::Acquire) {
+                let result = self.tx_results[num_commit]
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .execute_result
+                    .clone();
+                let Ok(result) = result else { panic!("Commit error transaction") };
+                self.commiter.commit(result, &self.cache);
+                num_commit += 1;
+            }
+            *commit_notifier.0.lock().unwrap() = false;
+        }
+    }
+
+    pub fn commiter(&mut self) -> &mut C {
+        &mut self.commiter
+    }
+
     pub fn parallel_execute(
         &self,
         concurrency_level: Option<usize>,
     ) -> Result<(), EVMError<DB::Error>> {
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let cache = SharedCacheData::new();
-        let coinbase = self.env.block.coinbase.clone();
         let lock = Mutex::new(());
+        let commit_notifier = (Mutex::new(false), Condvar::new());
         thread::scope(|scope| {
+            scope.spawn(|| {
+                self.async_commit(&commit_notifier);
+            });
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
                     let mut cache_db = CacheDB::new(
                         self.env.block.coinbase,
                         &self.db,
-                        &cache,
+                        &self.cache,
                         &self.mv_memory,
                         &self,
                     );
@@ -129,7 +175,7 @@ where
                     loop {
                         let task = {
                             let _lock = lock.lock().unwrap();
-                            self.next()
+                            self.next(&commit_notifier)
                         };
                         if let Some(task) = task {
                             match task {
@@ -147,8 +193,8 @@ where
                 });
             }
         });
-        if self.abort.load(Ordering::Relaxed) {
-            let result = self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock().unwrap();
+        if self.abort.load(Ordering::Acquire) {
+            let result = self.tx_results[self.finality_idx.load(Ordering::Acquire)].lock().unwrap();
             if let Some(result) = result.as_ref() {
                 if let Err(e) = &result.execute_result {
                     return Err(e.clone());
@@ -164,7 +210,7 @@ where
     where
         RA: RewardsAccumulator,
     {
-        let finality_idx = self.finality_idx.load(Ordering::Relaxed);
+        let finality_idx = self.finality_idx.load(Ordering::Acquire);
         let TxVersion { txid, incarnation } = tx_version;
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         *evm.tx_mut() = self.txs[txid].clone();
@@ -209,7 +255,7 @@ where
                     if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        for dep_id in self.finality_idx.load(Ordering::Relaxed)..txid {
+                        for dep_id in self.finality_idx.load(Ordering::Acquire)..txid {
                             tx_dependency.update_dependency(txid, dep_id);
                         }
                     } else {
@@ -349,7 +395,7 @@ where
                 // written_transactions
                 if let Some((dep_id, _)) = written_transactions.range(..txid).next_back() {
                     let dep_id = *dep_id;
-                    if dep_id > self.finality_idx.load(Ordering::Relaxed) {
+                    if dep_id > self.finality_idx.load(Ordering::Acquire) {
                         dep_ids.insert(dep_id);
                     }
                 }
@@ -358,26 +404,29 @@ where
         dep_ids
     }
 
-    pub fn next(&self) -> Option<Task> {
-        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
-            !self.abort.load(Ordering::Relaxed)
+    pub fn next(&self, commit_notifier: &(Mutex<bool>, Condvar)) -> Option<Task> {
+        while self.finality_idx.load(Ordering::Acquire) < self.block_size &&
+            !self.abort.load(Ordering::Acquire)
         {
             // Confirm the finality and conflict status
-            while self.finality_idx.load(Ordering::Relaxed) <
-                self.validation_idx.load(Ordering::Relaxed)
+            while self.finality_idx.load(Ordering::Acquire) <
+                self.validation_idx.load(Ordering::Acquire)
             {
                 let mut tx =
-                    self.tx_states[self.finality_idx.load(Ordering::Relaxed)].lock().unwrap();
+                    self.tx_states[self.finality_idx.load(Ordering::Acquire)].lock().unwrap();
                 match tx.status {
                     TransactionStatus::Unconfirmed => {
                         tx.status = TransactionStatus::Finality;
                         let txid = self.finality_idx.fetch_add(1, Ordering::Release);
                         self.tx_dependency.lock().unwrap().remove(txid);
+                        let mut ready = commit_notifier.0.lock().unwrap();
+                        *ready = true;
+                        commit_notifier.1.notify_one();
                     }
                     TransactionStatus::Conflict => {
                         // Subsequent transactions after conflict need to be revalidated
                         self.validation_idx
-                            .store(self.finality_idx.load(Ordering::Relaxed), Ordering::Release);
+                            .store(self.finality_idx.load(Ordering::Acquire), Ordering::Release);
                         break;
                     }
                     _ => {
@@ -386,10 +435,10 @@ where
                 }
             }
             // Prior to submit validation task
-            while self.validation_idx.load(Ordering::Relaxed) <
-                self.execution_idx.load(Ordering::Relaxed)
+            while self.validation_idx.load(Ordering::Acquire) <
+                self.execution_idx.load(Ordering::Acquire)
             {
-                let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+                let validation_idx = self.validation_idx.load(Ordering::Acquire);
                 let mut tx = self.tx_states[validation_idx].lock().unwrap();
                 if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
                 {
@@ -415,6 +464,9 @@ where
             }
             thread::yield_now();
         }
+        let mut ready = commit_notifier.0.lock().unwrap();
+        *ready = true;
+        commit_notifier.1.notify_one();
         None
     }
 }

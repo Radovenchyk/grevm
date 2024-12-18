@@ -1,3 +1,4 @@
+mod async_commit;
 mod hint;
 mod scheduler;
 mod storage;

@@ -10,7 +10,7 @@ use revm_primitives::{
     AccountInfo, Address, Bytecode, EvmState, B256, KECCAK_EMPTY, U256,
 };
 
-pub type SharedCacheData = DashMap<LocationAndType, MemoryValue>;
+pub type CachedStorageData = DashMap<LocationAndType, MemoryValue>;
 
 pub(crate) struct CacheDB<'a, DB, RA>
 where
@@ -19,7 +19,7 @@ where
 {
     coinbase: Address,
     db: &'a DB,
-    cache: &'a SharedCacheData,
+    cache: &'a CachedStorageData,
     mv_memory: &'a MVMemory,
     rewards_accumulator: &'a RA,
 
@@ -38,7 +38,7 @@ where
     pub fn new(
         coinbase: Address,
         db: &'a DB,
-        cache: &'a SharedCacheData,
+        cache: &'a CachedStorageData,
         mv_memory: &'a MVMemory,
         rewards_accumulator: &'a RA,
     ) -> Self {
@@ -267,7 +267,7 @@ where
         }
 
         self.read_set.insert(location, read_version);
-        Ok(result.expect("no bytecode"))
+        Ok(result.expect("No bytecode"))
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -299,7 +299,7 @@ where
         }
 
         self.read_set.insert(location, read_version);
-        Ok(result.expect("no storage slot"))
+        Ok(result.expect("No storage slot"))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
