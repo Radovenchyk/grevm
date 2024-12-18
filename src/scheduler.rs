@@ -1,16 +1,19 @@
 use crate::{
-    hint::ParallelExecutionHints, storage::CacheState, tx_dependency::TxDependency,
+    hint::ParallelExecutionHints,
+    storage::{CacheDB, SharedCacheData},
+    tx_dependency::TxDependency,
     LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
-    TxState, CONCURRENT_LEVEL,
+    TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use auto_impl::auto_impl;
 use dashmap::DashMap;
-use revm::EvmBuilder;
-use revm_primitives::{db::DatabaseRef, TxEnv};
+use revm::{Evm, EvmBuilder};
+use revm_primitives::{db::DatabaseRef, EVMError, EVMResult, Env, SpecId, TxEnv, TxKind};
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -18,120 +21,271 @@ use std::{
 
 pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
+#[auto_impl(&)]
+pub trait RewardsAccumulator {
+    fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128>;
+}
+
 pub struct Scheduler<DB>
 where
     DB: DatabaseRef,
 {
-    concurrency_level: usize,
+    spec_id: SpecId,
+    env: Env,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    cache_state: CacheState<DB>,
+    db: DB,
     tx_states: Vec<Mutex<TxState>>,
-    tx_results: Vec<Mutex<TransactionResult<DB::Error>>>,
+    tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
     tx_dependency: Mutex<TxDependency>,
 
-    mv_memory: Arc<MVMemory>,
+    mv_memory: MVMemory,
 
     finality_idx: AtomicUsize,
     validation_idx: AtomicUsize,
     execution_idx: AtomicUsize,
+
+    abort: AtomicBool,
+}
+
+impl<DB> RewardsAccumulator for Scheduler<DB>
+where
+    DB: DatabaseRef,
+{
+    fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128> {
+        // register miner accumulator
+        if to > 0 {
+            if self.tx_states[to - 1].lock().unwrap().status != TransactionStatus::Finality {
+                return None;
+            }
+        }
+        let mut rewards = 0;
+        for prev in from.unwrap_or(0)..to {
+            let tx_result = self.tx_results[prev].lock().unwrap();
+            let Some(result) = tx_result.as_ref() else {
+                return None;
+            };
+            let Ok(result) = &result.execute_result else {
+                return None;
+            };
+            rewards += result.rewards;
+        }
+        Some(rewards)
+    }
 }
 
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
-    DB::Error: Send + Sync,
+    DB::Error: Clone + Send + Sync,
 {
-    pub fn new(concurrency_level: usize, txs: Arc<Vec<TxEnv>>, db: DB, with_hints: bool) -> Self {
-        let mv_memory = Arc::new(MVMemory::new());
+    pub fn new(spec_id: SpecId, env: Env, txs: Arc<Vec<TxEnv>>, db: DB, with_hints: bool) -> Self {
+        let num_txs = txs.len();
         let tx_dependency = if with_hints {
             ParallelExecutionHints::new(txs.clone()).parse_hints()
         } else {
-            TxDependency::new(txs.len())
+            TxDependency::new(num_txs)
         };
         Self {
-            concurrency_level,
-            block_size: txs.len(),
+            spec_id,
+            env,
+            block_size: num_txs,
             txs,
-            cache_state: CacheState::new(db, mv_memory.clone()),
-            tx_states: vec![],
-            tx_results: vec![],
+            db,
+            tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
+            tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
             tx_dependency: Mutex::new(tx_dependency),
-            mv_memory,
+            mv_memory: MVMemory::new(),
             finality_idx: AtomicUsize::new(0),
             validation_idx: AtomicUsize::new(0),
             execution_idx: AtomicUsize::new(0),
+            abort: AtomicBool::new(false),
         }
     }
 
-    pub fn parallel_evm(&self, concurrency_level: Option<usize>) {
+    pub fn parallel_execute(
+        &self,
+        concurrency_level: Option<usize>,
+    ) -> Result<(), EVMError<DB::Error>> {
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
+        let cache = SharedCacheData::new();
+        let coinbase = self.env.block.coinbase.clone();
         let lock = Mutex::new(());
         thread::scope(|scope| {
-            for _ in 0..self.concurrency_level {
-                scope.spawn(|| loop {
-                    let task = {
-                        let _lock = lock.lock().unwrap();
-                        self.next()
-                    };
-                    if let Some(task) = task {
-                        match task {
-                            Task::Execution(txid) => {
-                                self.execute(txid);
+            for _ in 0..concurrency_level {
+                scope.spawn(|| {
+                    let mut cache_db = CacheDB::new(
+                        self.env.block.coinbase,
+                        &self.db,
+                        &cache,
+                        &self.mv_memory,
+                        &self,
+                    );
+                    let mut evm = EvmBuilder::default()
+                        .with_db(&mut cache_db)
+                        .with_spec_id(self.spec_id.clone())
+                        .with_env(Box::new(self.env.clone()))
+                        .build();
+                    loop {
+                        let task = {
+                            let _lock = lock.lock().unwrap();
+                            self.next()
+                        };
+                        if let Some(task) = task {
+                            match task {
+                                Task::Execution(tx_version) => {
+                                    self.execute(&mut evm, tx_version);
+                                }
+                                Task::Validation(tx_version) => {
+                                    self.validate(tx_version);
+                                }
                             }
-                            Task::Validation(txid) => {
-                                self.validate(txid);
-                            }
+                        } else {
+                            break;
                         }
-                    } else {
-                        break;
                     }
                 });
             }
         });
+        if self.abort.load(Ordering::Relaxed) {
+            let result = self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock().unwrap();
+            if let Some(result) = result.as_ref() {
+                if let Err(e) = &result.execute_result {
+                    return Err(e.clone());
+                }
+            }
+            panic!("Wrong abort transaction")
+        } else {
+            Ok(())
+        }
     }
 
-    fn execute(&self, txid: TxId) {
-        let mut evm = EvmBuilder::default()
-            .with_ref_db(&self.cache_state)
-            // .with_spec_id(self.spec_id)
-            // .with_env(Box::new(std::mem::take(&mut self.env)))
-            .build();
-
+    fn execute<RA>(&self, evm: &mut Evm<'_, (), &mut CacheDB<DB, RA>>, tx_version: TxVersion)
+    where
+        RA: RewardsAccumulator,
+    {
+        let finality_idx = self.finality_idx.load(Ordering::Relaxed);
+        let TxVersion { txid, incarnation } = tx_version;
+        evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
+        *evm.tx_mut() = self.txs[txid].clone();
         let result = evm.transact_lazy_reward();
-        let miner_involved = self.cache_state.miner_involved();
-        let conflict = self.cache_state.visit_estimate();
-        let read_set = self.cache_state.take_read_set();
 
-        if conflict {
-            if miner_involved {
-                let mut tx_dependency = self.tx_dependency.lock().unwrap();
-                for dep_id in self.finality_idx.load(Ordering::Relaxed)..txid {
-                    tx_dependency.update_dependency(txid, dep_id);
+        match result {
+            Ok(result_and_state) => {
+                // only the miner involved in transaction should accumulate the rewards of finality
+                // txs return true if the tx doesn't visit the miner account
+                let rewards_accumulated = evm.db().rewards_accumulated();
+                let conflict = !rewards_accumulated || evm.db().visit_estimate();
+                let read_set = evm.db_mut().take_read_set();
+                let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
+
+                let mut last_result = self.tx_results[txid].lock().unwrap();
+                if let Some(last_result) = last_result.as_ref() {
+                    for location in &last_result.write_set {
+                        if !write_set.contains(location) {
+                            if let Some(mut written_transactions) = self.mv_memory.get_mut(location)
+                            {
+                                written_transactions.remove(&txid);
+                            }
+                        }
+                    }
                 }
-            } else {
+
+                // update transaction status
+                {
+                    let mut tx_state = self.tx_states[txid].lock().unwrap();
+                    if tx_state.incarnation != incarnation {
+                        panic!("Inconsistent incarnation when execution");
+                    }
+                    tx_state.status = if conflict {
+                        TransactionStatus::Conflict
+                    } else {
+                        TransactionStatus::Executed
+                    };
+                }
+
+                if conflict {
+                    let mut tx_dependency = self.tx_dependency.lock().unwrap();
+                    if !rewards_accumulated {
+                        // Add all previous transactions as dependencies if miner doesn't accumulate
+                        // the rewards
+                        for dep_id in self.finality_idx.load(Ordering::Relaxed)..txid {
+                            tx_dependency.update_dependency(txid, dep_id);
+                        }
+                    } else {
+                        for dep_id in self.generate_dependent_txs(txid, &read_set) {
+                            tx_dependency.update_dependency(txid, dep_id);
+                        }
+                    }
+                }
+                *last_result = Some(TransactionResult {
+                    read_set,
+                    write_set,
+                    execute_result: Ok(result_and_state),
+                });
+            }
+            Err(e) => {
+                let mut read_set = evm.db_mut().take_read_set();
+                let mut write_set = HashSet::new();
+                read_set
+                    .entry(LocationAndType::Basic(evm.tx().caller))
+                    .or_insert(ReadVersion::Storage);
+                if let TxKind::Call(to) = evm.tx().transact_to {
+                    read_set.entry(LocationAndType::Basic(to)).or_insert(ReadVersion::Storage);
+                }
+
+                let mut last_result = self.tx_results[txid].lock().unwrap();
+                if let Some(last_result) = last_result.as_mut() {
+                    write_set = std::mem::take(&mut last_result.write_set);
+                    for location in write_set.iter() {
+                        if let Some(mut written_transactions) = self.mv_memory.get_mut(location) {
+                            if let Some(entry) = written_transactions.get_mut(&txid) {
+                                entry.estimate = true;
+                            }
+                        }
+                    }
+                }
+
+                // update transaction status
+                {
+                    let mut tx_state = self.tx_states[txid].lock().unwrap();
+                    if tx_state.incarnation != incarnation {
+                        panic!("Inconsistent incarnation when execution");
+                    }
+                    tx_state.status = TransactionStatus::Conflict;
+                }
                 let mut tx_dependency = self.tx_dependency.lock().unwrap();
                 for dep_id in self.generate_dependent_txs(txid, &read_set) {
                     tx_dependency.update_dependency(txid, dep_id);
                 }
+                *last_result =
+                    Some(TransactionResult { read_set, write_set, execute_result: Err(e) });
+                if finality_idx == txid {
+                    self.abort.store(true, Ordering::Release);
+                }
             }
-        } else {
-            self.tx_dependency.lock().unwrap().remove(txid);
         }
     }
 
-    fn validate(&self, txid: TxId) {
+    fn validate(&self, tx_version: TxVersion) {
+        let TxVersion { txid, incarnation } = tx_version;
         // check the read version of read set
         let mut conflict = false;
-        let tx_state = self.tx_results[txid].lock().unwrap();
-        for (location, version) in tx_state.read_set.iter() {
+        let tx_result = self.tx_results[txid].lock().unwrap();
+        let Some(result) = tx_result.as_ref() else {
+            panic!("No result when validating");
+        };
+        if let Err(_) = &result.execute_result {
+            panic!("Error transaction should take as conflict before validating");
+        }
+
+        for (location, version) in result.read_set.iter() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
-                if let Some((previous_tid, latest_version)) =
+                if let Some((previous_id, latest_version)) =
                     written_transactions.range(..txid).next_back()
                 {
                     if let ReadVersion::MvMemory(version) = version {
-                        let latest_version = &latest_version.tx_version;
-                        if version.txid != latest_version.txid ||
+                        if version.txid != *previous_id ||
                             version.incarnation != latest_version.incarnation
                         {
                             conflict = true;
@@ -151,17 +305,35 @@ where
             }
         }
 
-        // update dependency
-        if conflict {
-            let dep_ids = self.generate_dependent_txs(txid, &tx_state.read_set);
-            self.tx_dependency.lock().unwrap().add(txid, dep_ids);
-        }
-
         // update transaction status
         {
             let mut tx_state = self.tx_states[txid].lock().unwrap();
+            if tx_state.incarnation != incarnation {
+                panic!("Inconsistent incarnation when validating");
+            }
             tx_state.status =
                 if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
+        }
+
+        if conflict {
+            // update dependency
+            let dep_ids = self.generate_dependent_txs(txid, &result.read_set);
+            self.tx_dependency.lock().unwrap().add(txid, dep_ids);
+
+            // mark write set as estimate
+            self.mark_estimate(txid, incarnation, &result.write_set);
+        }
+    }
+
+    fn mark_estimate(&self, txid: TxId, incarnation: usize, write_set: &HashSet<LocationAndType>) {
+        for location in write_set {
+            if let Some(mut written_transactions) = self.mv_memory.get_mut(location) {
+                if let Some(entry) = written_transactions.get_mut(&txid) {
+                    if entry.incarnation == incarnation {
+                        entry.estimate = true;
+                    }
+                }
+            }
         }
     }
 
@@ -176,7 +348,10 @@ where
                 // To prevent dependency explosion, only add the tx with the highest TxId in
                 // written_transactions
                 if let Some((dep_id, _)) = written_transactions.range(..txid).next_back() {
-                    dep_ids.insert(*dep_id);
+                    let dep_id = *dep_id;
+                    if dep_id > self.finality_idx.load(Ordering::Relaxed) {
+                        dep_ids.insert(dep_id);
+                    }
                 }
             }
         }
@@ -184,7 +359,9 @@ where
     }
 
     pub fn next(&self) -> Option<Task> {
-        while self.finality_idx.load(Ordering::Relaxed) < self.block_size {
+        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
+            !self.abort.load(Ordering::Relaxed)
+        {
             // Confirm the finality and conflict status
             while self.finality_idx.load(Ordering::Relaxed) <
                 self.validation_idx.load(Ordering::Relaxed)
@@ -194,7 +371,8 @@ where
                 match tx.status {
                     TransactionStatus::Unconfirmed => {
                         tx.status = TransactionStatus::Finality;
-                        self.finality_idx.fetch_add(1, Ordering::Release);
+                        let txid = self.finality_idx.fetch_add(1, Ordering::Release);
+                        self.tx_dependency.lock().unwrap().remove(txid);
                     }
                     TransactionStatus::Conflict => {
                         // Subsequent transactions after conflict need to be revalidated
@@ -217,23 +395,25 @@ where
                 {
                     self.validation_idx.fetch_add(1, Ordering::Release);
                     tx.status = TransactionStatus::Validating;
-                    return Some(Task::Validation(validation_idx));
+                    return Some(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
+                } else {
+                    break;
                 }
             }
             // Submit execution task
-            let execute_id = self.tx_dependency.lock().unwrap().next();
-            if let Some(execute_id) = execute_id {
+            let mut tx_dependency = self.tx_dependency.lock().unwrap();
+            while let Some(execute_id) = tx_dependency.next() {
                 let mut tx = self.tx_states[execute_id].lock().unwrap();
-                if matches!(tx.status, TransactionStatus::Executing | TransactionStatus::Finality) {
-                    panic!("Unreachable");
+                if !matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+                    tx_dependency.remove(execute_id);
+                    continue;
                 }
                 self.execution_idx.fetch_max(execute_id, Ordering::Release);
                 tx.status = TransactionStatus::Executing;
                 tx.incarnation += 1;
-                return Some(Task::Execution(execute_id));
-            } else {
-                thread::yield_now();
+                return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
             }
+            thread::yield_now();
         }
         None
     }

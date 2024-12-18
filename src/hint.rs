@@ -138,7 +138,6 @@ impl ParallelExecutionHints {
                     if !tx_env.data.is_empty() {
                         rw_set
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);
-                        rw_set.insert_location(LocationAndType::Code(to_address), RWType::ReadOnly);
                         // Update hints with contract data based on the transaction details
                         if !ParallelExecutionHints::update_hints_with_contract_data(
                             tx_env.caller,

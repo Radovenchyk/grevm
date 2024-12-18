@@ -40,35 +40,53 @@ struct TxVersion {
     pub incarnation: usize,
 }
 
+impl TxVersion {
+    pub fn new(txid: TxId, incarnation: usize) -> Self {
+        Self { txid, incarnation }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ReadVersion {
     MvMemory(TxVersion),
     Storage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountBasic {
+    /// The balance of the account.
+    pub balance: U256,
+    /// The nonce of the account.
+    pub nonce: u64,
+    pub is_eoa: bool,
+}
+
 #[derive(Debug, Clone)]
 enum MemoryValue {
     Basic(AccountInfo),
     Code(Bytecode),
-    Slot(U256),
+    Storage(U256),
 }
 
 struct MemoryEntry {
-    tx_version: TxVersion,
+    incarnation: usize,
     data: MemoryValue,
     estimate: bool,
 }
 
+impl MemoryEntry {
+    pub fn new(incarnation: usize, data: MemoryValue, estimate: bool) -> Self {
+        Self { incarnation, data, estimate }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LocationAndType {
-    /// Represents a basic address location(for EOA).
     Basic(Address),
 
-    /// Represents a storage location with an address and a storage slot(for CA).
     Storage(Address, U256),
 
-    /// Represents a contract code location with an address(for CA).
-    Code(Address),
+    Code(B256),
 }
 
 struct TransactionResult<DBError> {
@@ -78,8 +96,8 @@ struct TransactionResult<DBError> {
 }
 
 enum Task {
-    Execution(TxId),
-    Validation(TxId),
+    Execution(TxVersion),
+    Validation(TxVersion),
 }
 
 /// Utility function for parallel execution using fork-join pattern.

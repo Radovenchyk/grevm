@@ -40,7 +40,13 @@ impl TxDependency {
     }
 
     pub fn add<D: IntoIterator<Item = TxId>>(&mut self, txid: TxId, dependent_txs: D) {
-        self.dependent_txs[txid].extend(dependent_txs);
+        for dep_id in dependent_txs {
+            self.dependent_txs[txid].insert(dep_id);
+            self.affect_txs[dep_id].insert(txid);
+            if self.dependent_txs[dep_id].is_empty() {
+                self.no_dep_txs.insert(dep_id);
+            }
+        }
         if self.dependent_txs[txid].is_empty() {
             self.no_dep_txs.insert(txid);
         }
@@ -50,5 +56,8 @@ impl TxDependency {
         self.dependent_txs[from].insert(to);
         self.affect_txs[to].insert(from);
         self.no_dep_txs.remove(&from);
+        if self.dependent_txs[to].is_empty() {
+            self.no_dep_txs.insert(to);
+        }
     }
 }
