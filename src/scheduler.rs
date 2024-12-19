@@ -19,6 +19,7 @@ use std::{
     },
     thread,
 };
+use tokio::time::Instant;
 
 pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
@@ -37,7 +38,7 @@ where
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
     db: DB,
-    commiter: C,
+    commiter: Mutex<C>,
     cache: CachedStorageData,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
@@ -83,7 +84,7 @@ impl<DB, C> Scheduler<DB, C>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync,
-    C: AsyncCommit + Send + Sync,
+    C: AsyncCommit + Send,
 {
     pub fn new(
         spec_id: SpecId,
@@ -105,7 +106,7 @@ where
             block_size: num_txs,
             txs,
             db,
-            commiter,
+            commiter: Mutex::new(commiter),
             cache: CachedStorageData::new(),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
@@ -136,15 +137,19 @@ where
                     .execute_result
                     .clone();
                 let Ok(result) = result else { panic!("Commit error transaction") };
-                self.commiter.commit(result, &self.cache);
+                self.commiter.lock().unwrap().commit(result, &self.cache);
                 num_commit += 1;
             }
             *commit_notifier.0.lock().unwrap() = false;
         }
     }
 
-    pub fn commiter(&mut self) -> &mut C {
-        &mut self.commiter
+    pub fn with_commiter<F, R>(&self, func: F) -> R
+    where
+        F: FnOnce(&mut C) -> R,
+    {
+        let mut commiter = self.commiter.lock().unwrap();
+        func(&mut *commiter)
     }
 
     pub fn parallel_execute(
@@ -255,13 +260,9 @@ where
                     if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        for dep_id in self.finality_idx.load(Ordering::Acquire)..txid {
-                            tx_dependency.update_dependency(txid, dep_id);
-                        }
+                        tx_dependency.add(txid, self.finality_idx.load(Ordering::Acquire)..txid);
                     } else {
-                        for dep_id in self.generate_dependent_txs(txid, &read_set) {
-                            tx_dependency.update_dependency(txid, dep_id);
-                        }
+                        tx_dependency.add(txid, self.generate_dependent_txs(txid, &read_set));
                     }
                 }
                 *last_result = Some(TransactionResult {
@@ -301,9 +302,7 @@ where
                     tx_state.status = TransactionStatus::Conflict;
                 }
                 let mut tx_dependency = self.tx_dependency.lock().unwrap();
-                for dep_id in self.generate_dependent_txs(txid, &read_set) {
-                    tx_dependency.update_dependency(txid, dep_id);
-                }
+                tx_dependency.add(txid, self.generate_dependent_txs(txid, &read_set));
                 *last_result =
                     Some(TransactionResult { read_set, write_set, execute_result: Err(e) });
                 if finality_idx == txid {
@@ -363,8 +362,10 @@ where
 
         if conflict {
             // update dependency
-            let dep_ids = self.generate_dependent_txs(txid, &result.read_set);
-            self.tx_dependency.lock().unwrap().add(txid, dep_ids);
+            self.tx_dependency
+                .lock()
+                .unwrap()
+                .add(txid, self.generate_dependent_txs(txid, &result.read_set));
 
             // mark write set as estimate
             self.mark_estimate(txid, incarnation, &result.write_set);
@@ -405,6 +406,7 @@ where
     }
 
     pub fn next(&self, commit_notifier: &(Mutex<bool>, Condvar)) -> Option<Task> {
+        let mut start = Instant::now();
         while self.finality_idx.load(Ordering::Acquire) < self.block_size &&
             !self.abort.load(Ordering::Acquire)
         {
@@ -423,7 +425,7 @@ where
                         *ready = true;
                         commit_notifier.1.notify_one();
                     }
-                    TransactionStatus::Conflict => {
+                    TransactionStatus::Conflict | TransactionStatus::Executed => {
                         // Subsequent transactions after conflict need to be revalidated
                         self.validation_idx
                             .store(self.finality_idx.load(Ordering::Acquire), Ordering::Release);
@@ -457,12 +459,30 @@ where
                     tx_dependency.remove(execute_id);
                     continue;
                 }
-                self.execution_idx.fetch_max(execute_id, Ordering::Release);
+                self.execution_idx.fetch_max(execute_id + 1, Ordering::Release);
                 tx.status = TransactionStatus::Executing;
                 tx.incarnation += 1;
                 return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
             }
             thread::yield_now();
+            if (Instant::now() - start).as_millis() > 4_000 {
+                start = Instant::now();
+                let execute_idx = self.execution_idx.load(Ordering::Acquire);
+                println!(
+                    "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                    self.finality_idx.load(Ordering::Acquire),
+                    self.validation_idx.load(Ordering::Acquire),
+                    execute_idx
+                );
+                let status: Vec<(TxId, TransactionStatus)> = self
+                    .tx_states
+                    .iter()
+                    .map(|s| s.lock().unwrap().status.clone())
+                    .enumerate()
+                    .collect();
+                println!("transaction status: {:?}", status);
+                tx_dependency.print();
+            }
         }
         let mut ready = commit_notifier.0.lock().unwrap();
         *ready = true;

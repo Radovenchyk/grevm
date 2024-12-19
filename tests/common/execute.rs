@@ -2,19 +2,16 @@ use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
-use grevm::{ExecuteOutput, GrevmScheduler};
+use grevm::{Scheduler, StateAsyncCommit};
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, StorageSlot},
-        AccountRevert, BundleAccount, BundleState, PlainAccount,
-    },
+    db::{states::StorageSlot, AccountRevert, BundleAccount, BundleState, PlainAccount},
     primitives::{
         alloy_primitives::U160, uint, AccountInfo, Address, Bytecode, EVMError, Env,
         ExecutionResult, SpecId, TxEnv, B256, KECCAK_EMPTY, U256,
     },
     DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder,
 };
-use revm_primitives::EnvWithHandlerCfg;
+use revm_primitives::{EnvWithHandlerCfg, ResultAndState};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
@@ -23,6 +20,24 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+
+pub(crate) fn compare_result_and_state(left: &Vec<ResultAndState>, right: &Vec<ResultAndState>) {
+    assert_eq!(left.len(), right.len());
+    for (l, r) in left.iter().zip(right.iter()) {}
+    for txid in 0..left.len() {
+        assert_eq!(left[txid].rewards, right[txid].rewards, "Tx {}", txid);
+        assert_eq!(left[txid].result, right[txid].result, "Tx {}", txid);
+        let l = &left[txid].state;
+        let r = &right[txid].state;
+        for (address, l) in l {
+            let r =
+                r.get(address).expect(format!("no account {:?} in Tx {}", address, txid).as_str());
+            assert_eq!(l.info, r.info, "account {:?} info in Tx {}", address, txid);
+            assert_eq!(l.storage, r.storage, "account {:?} storage in Tx {}", address, txid);
+            assert_eq!(l.status, r.status, "account {:?} status in Tx {}", address, txid);
+        }
+    }
+}
 
 pub(crate) fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
@@ -123,23 +138,21 @@ pub(crate) fn compare_evm_execute<DB>(
     env.block.coinbase = Address::from(U160::from(MINER_ADDRESS));
     let db = Arc::new(db);
     let txs = Arc::new(txs);
-    let start = Instant::now();
-    let sequential_result = {
-        let mut executor =
-            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone(), None);
-        let sequential_result = executor.force_sequential_execute().unwrap();
-        println!("Grevm sequential execute time: {}ms", start.elapsed().as_millis());
-        let database = Arc::get_mut(&mut executor.database).unwrap();
-        database.state.merge_transitions(BundleRetention::Reverts);
-        (sequential_result, database.state.take_bundle())
-    };
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let mut executor =
-            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone(), None);
+        let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
+        let mut executor = Scheduler::new(
+            SpecId::LATEST,
+            env.clone(),
+            txs.clone(),
+            db.clone(),
+            commiter,
+            with_hints,
+        );
         // set determined partitions
-        let parallel_result = executor.force_parallel_execute(with_hints, Some(23)).unwrap();
+        executor.parallel_execute(Some(23)).expect("parallel execute failed");
+        let result = executor.with_commiter(|commiter| commiter.take_result());
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();
@@ -154,19 +167,18 @@ pub(crate) fn compare_evm_execute<DB>(
                 assert_eq!(*metric, v);
             }
         }
-        let database = Arc::get_mut(&mut executor.database).unwrap();
-        database.state.merge_transitions(BundleRetention::Reverts);
-        (parallel_result, database.state.take_bundle())
+        result
     });
 
     let start = Instant::now();
-    let reth_result = execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), &*txs);
+    let reth_result =
+        execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), &*txs).unwrap();
     println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
 
     let mut max_gas_spent = 0;
     let mut max_gas_used = 0;
-    for result in &reth_result.as_ref().unwrap().0.results {
-        match result {
+    for result in reth_result.iter() {
+        match &result.result {
             ExecutionResult::Success { gas_used, gas_refunded, .. } => {
                 max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
                 max_gas_used = max_gas_used.max(*gas_used);
@@ -175,15 +187,7 @@ pub(crate) fn compare_evm_execute<DB>(
         }
     }
     println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
-
-    compare_execution_result(
-        &reth_result.as_ref().unwrap().0.results,
-        &sequential_result.0.results,
-    );
-    compare_execution_result(&reth_result.as_ref().unwrap().0.results, &parallel_result.0.results);
-
-    compare_bundle_state(&reth_result.as_ref().unwrap().1, &sequential_result.1);
-    compare_bundle_state(&reth_result.as_ref().unwrap().1, &parallel_result.1);
+    compare_result_and_state(&reth_result, &parallel_result);
 }
 
 /// Simulate the sequential execution of transactions in reth
@@ -192,7 +196,7 @@ pub(crate) fn execute_revm_sequential<DB>(
     spec_id: SpecId,
     env: Env,
     txs: &[TxEnv],
-) -> Result<(ExecuteOutput, BundleState), EVMError<DB::Error>>
+) -> Result<Vec<ResultAndState>, EVMError<DB::Error>>
 where
     DB: DatabaseRef,
     DB::Error: Debug,
@@ -205,13 +209,11 @@ where
     for tx in txs {
         *evm.tx_mut() = tx.clone();
         let result_and_state = evm.transact()?;
-        evm.db_mut().commit(result_and_state.state);
-        results.push(result_and_state.result);
+        evm.db_mut().commit(result_and_state.state.clone());
+        results.push(result_and_state);
     }
 
-    evm.db_mut().merge_transitions(BundleRetention::Reverts);
-
-    Ok((ExecuteOutput { results }, evm.db_mut().take_bundle()))
+    Ok(results)
 }
 
 const TEST_DATA_DIR: &str = "test_data";

@@ -1,6 +1,6 @@
 use crate::TxId;
 use ahash::AHashSet as HashSet;
-use std::{collections::BTreeSet, mem};
+use std::collections::BTreeSet;
 
 pub struct TxDependency {
     dependent_txs: Vec<HashSet<TxId>>,
@@ -30,7 +30,7 @@ impl TxDependency {
     }
 
     pub fn remove(&mut self, txid: TxId) {
-        let affect_txs = mem::take(&mut self.affect_txs[txid]);
+        let affect_txs = std::mem::take(&mut self.affect_txs[txid]);
         for affect_tx in affect_txs {
             self.dependent_txs[affect_tx].remove(&txid);
             if self.dependent_txs[affect_tx].is_empty() {
@@ -52,12 +52,13 @@ impl TxDependency {
         }
     }
 
-    pub fn update_dependency(&mut self, from: TxId, to: TxId) {
-        self.dependent_txs[from].insert(to);
-        self.affect_txs[to].insert(from);
-        self.no_dep_txs.remove(&from);
-        if self.dependent_txs[to].is_empty() {
-            self.no_dep_txs.insert(to);
-        }
+    pub fn print(&self) {
+        println!("no_dep_txs: {:?}", self.no_dep_txs);
+        let dependent_txs: Vec<(TxId, HashSet<TxId>)> =
+            self.dependent_txs.clone().into_iter().enumerate().collect();
+        let affect_txs: Vec<(TxId, HashSet<TxId>)> =
+            self.affect_txs.clone().into_iter().enumerate().collect();
+        println!("dependent_txs: {:?}", dependent_txs);
+        println!("affect_txs: {:?}", affect_txs);
     }
 }
