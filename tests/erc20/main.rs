@@ -10,7 +10,6 @@ use crate::{
     },
 };
 use common::storage::InMemoryDB;
-use metrics_util::debugging::DebugValue;
 use revm::primitives::{alloy_primitives::U160, uint, Address, TransactTo, TxEnv, U256};
 use std::collections::HashMap;
 

@@ -1,12 +1,11 @@
 #![allow(missing_docs)]
 
 mod common;
-use std::{io::BufWriter, sync::Arc};
+use std::sync::Arc;
 
 use common::storage::InMemoryDB;
-use grevm::GrevmScheduler;
+use grevm::{Scheduler, StateAsyncCommit};
 use metrics_util::debugging::DebuggingRecorder;
-use revm::db::states::bundle_state::BundleRetention;
 use revm_primitives::{EnvWithHandlerCfg, TxEnv};
 
 /// Return gas used
@@ -23,59 +22,22 @@ fn test_execute(
         common::execute_revm_sequential(db.clone(), env.spec_id(), env.env.as_ref().clone(), &*txs)
             .unwrap();
 
-    let sequential_result = {
-        let mut executor = GrevmScheduler::new(
-            env.spec_id(),
-            env.env.as_ref().clone(),
-            db.clone(),
-            txs.clone(),
-            None,
-        );
-        let parallel_result = executor.force_sequential_execute().unwrap();
-        let database = Arc::get_mut(&mut executor.database).unwrap();
-        if dump_transition {
-            serde_json::to_writer_pretty(
-                BufWriter::new(std::fs::File::create("transition_state_sequential.json").unwrap()),
-                &database.state.transition_state.as_ref().unwrap().transitions,
-            )
-            .unwrap();
-        }
-        database.state.merge_transitions(BundleRetention::Reverts);
-        (parallel_result, database.state.take_bundle())
-    };
-
     // create registry for metrics
     let recorder = DebuggingRecorder::new();
     let parallel_result = metrics::with_local_recorder(&recorder, || {
-        let mut executor = GrevmScheduler::new(env.spec_id(), *env.env, db, txs, None);
-        let parallel_result = executor.force_parallel_execute(true, Some(23)).unwrap();
+        let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
+        let mut executor = Scheduler::new(env.spec_id(), *env.env, txs, db, commiter, true);
+        executor.parallel_execute(None).unwrap();
 
         let snapshot = recorder.snapshotter().snapshot();
         for (key, _, _, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
         }
-
-        let database = Arc::get_mut(&mut executor.database).unwrap();
-        if dump_transition {
-            serde_json::to_writer(
-                BufWriter::new(std::fs::File::create("transition_state_parallel.json").unwrap()),
-                &database.state.transition_state.as_ref().unwrap().transitions,
-            )
-            .unwrap();
-        }
-        database.state.merge_transitions(BundleRetention::Reverts);
-        (parallel_result, database.state.take_bundle())
+        executor.with_commiter(|commiter| commiter.take_result())
     });
 
-    common::compare_execution_result(&reth_result.0.results, &sequential_result.0.results);
-    common::compare_execution_result(&reth_result.0.results, &parallel_result.0.results);
-
-    common::compare_bundle_state(&reth_result.1, &sequential_result.1);
-    common::compare_bundle_state(&reth_result.1, &parallel_result.1);
-
-    // TODO(gravity_nekomoto): compare the receipts root
-
-    reth_result.0.results.iter().map(|r| r.gas_used()).sum()
+    common::compare_result_and_state(&reth_result, &parallel_result);
+    reth_result.iter().map(|r| r.result.gas_used()).sum()
 }
 
 #[test]

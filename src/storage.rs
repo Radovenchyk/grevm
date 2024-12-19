@@ -97,7 +97,7 @@ where
                 // is newly created contract
                 let new_contract = has_code &&
                     account.info.code.is_some() &&
-                    read_account.map_or(true, |account| account.is_eoa);
+                    read_account.map_or(true, |account| account.code_hash.is_none());
                 if new_contract {
                     let location = LocationAndType::Code(account.info.code_hash);
                     write_set.insert(location.clone());
@@ -159,7 +159,7 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         let mut read_version = ReadVersion::Storage;
-        let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, is_eoa: true };
+        let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
         let location = LocationAndType::Basic(address.clone());
         // 1. read from multi-version memory
         if let Some(written_transactions) = self.mv_memory.get(&location) {
@@ -171,7 +171,11 @@ where
                     read_account = AccountBasic {
                         balance: info.balance,
                         nonce: info.nonce,
-                        is_eoa: info.is_empty_code_hash(),
+                        code_hash: if info.is_empty_code_hash() {
+                            None
+                        } else {
+                            Some(info.code_hash)
+                        },
                     };
                     read_version = ReadVersion::MvMemory(TxVersion::new(*txid, entry.incarnation));
                 }
@@ -184,7 +188,11 @@ where
                     read_account = AccountBasic {
                         balance: info.balance,
                         nonce: info.nonce,
-                        is_eoa: info.is_empty_code_hash(),
+                        code_hash: if info.is_empty_code_hash() {
+                            None
+                        } else {
+                            Some(info.code_hash)
+                        },
                     };
                     result = Some(info.clone());
                 }
@@ -194,7 +202,11 @@ where
                     read_account = AccountBasic {
                         balance: info.balance,
                         nonce: info.nonce,
-                        is_eoa: info.is_empty_code_hash(),
+                        code_hash: if info.is_empty_code_hash() {
+                            None
+                        } else {
+                            Some(info.code_hash)
+                        },
                     };
                     result = Some(info.clone());
                     self.cache.insert(location.clone(), MemoryValue::Basic(info));
@@ -292,7 +304,18 @@ where
                     result = Some(slot.clone());
                 }
             } else {
-                let slot = self.db.storage_ref(address, index)?;
+                let mut new_ca = false;
+                if let Some(account) = self.read_accounts.get(&address) {
+                    if let Some(code_hash) = account.code_hash {
+                        if let Some(ReadVersion::MvMemory(_)) =
+                            self.read_set.get(&LocationAndType::Code(code_hash))
+                        {
+                            new_ca = true;
+                        }
+                    }
+                }
+                let slot =
+                    if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
                 result = Some(slot.clone());
                 self.cache.insert(location.clone(), MemoryValue::Storage(slot));
             };

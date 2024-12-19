@@ -59,7 +59,7 @@ struct AccountBasic {
     pub balance: U256,
     /// The nonce of the account.
     pub nonce: u64,
-    pub is_eoa: bool,
+    pub code_hash: Option<B256>,
 }
 
 #[derive(Debug, Clone)]

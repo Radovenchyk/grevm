@@ -13,7 +13,7 @@
 
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
-use grevm::{GrevmError, GrevmScheduler};
+use grevm::{Scheduler, StateAsyncCommit};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
     db::PlainAccount,
@@ -136,27 +136,29 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
-            let mut executor = GrevmScheduler::new(spec_name.to_spec_id(), env, db, Arc::new(vec![tx_env.unwrap()]), None);
+            let commiter = StateAsyncCommit::new(env.block.coinbase, &db);
+            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), db, commiter, true);
 
             match (
                 test.expect_exception.as_deref(),
-                executor.parallel_execute(),
+                executor.parallel_execute(None),
             ) {
                 // EIP-2681
                 (Some("TransactionException.NONCE_IS_MAX"), Ok(exec_results)) => {
-                    assert_eq!(exec_results.results.len(), 1);
+                    let results = executor.with_commiter(|commiter| {
+                        commiter.take_result()
+                    });
+                    assert_eq!(results.len(), 1);
                     // This is overly strict as we only need the newly created account's code to be empty.
                     // Extracting such account is unjustified complexity so let's live with this for now.
-                    let state = Arc::get_mut(&mut executor.database).unwrap().state.take_bundle();
-                    assert!(state.state.values().all(|account| {
-                        match &account.info {
-                            Some(account) => account.is_empty_code_hash(),
-                            None => true,
-                        }
-                    }));
+                    results.iter().all(|accounts| {
+                        accounts.state.values().all(|account| {
+                            account.info.is_empty_code_hash()
+                        })
+                    });
                 }
                 // Remaining tests that expect execution to fail -> match error
-                (Some(exception), Err(GrevmError::EvmError(error))) => {
+                (Some(exception), Err(error)) => {
                     println!("Error-Error: {}: {:?}", exception, error.to_string());
                     let error = error.to_string();
                     assert!(match exception {
@@ -180,30 +182,28 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                     });
                 }
                 // Tests that exepect execution to succeed -> match post state root
-                (None, Ok(exec_results)) => {
-                    assert_eq!(exec_results.results.len(), 1);
-                    let logs = exec_results.results[0].clone().into_logs();
+                (None, Ok(_)) => {
+                    let results = executor.with_commiter(|commiter| {
+                        commiter.take_result()
+                    });
+                    assert_eq!(results.len(), 1);
+                    let logs = results[0].clone().result.into_logs();
                     let logs_root = log_rlp_hash(&logs);
                     assert_eq!(logs_root, test.logs, "Mismatched logs root for {path:?}");
 
                     // This is a good reference for a minimal state/DB commitment logic for
                     // pevm/revm to meet the Ethereum specs throughout the eras.
-                    let state = Arc::get_mut(&mut executor.database).unwrap().state.take_bundle();
-                    for (address, bundle) in state.state {
-                        if bundle.info.is_some() {
+                    for result_and_state in results {
+                        for (address, account) in result_and_state.state {
                             let chain_state_account = accounts.entry(address).or_default();
-                            for (index, slot) in bundle.storage.iter() {
+                            for (index, slot) in account.storage.iter() {
                                 chain_state_account.storage.insert(*index, slot.present_value);
                             }
-                        }
-                        if let Some(account) = bundle.info {
                             let chain_state_account = accounts.entry(address).or_default();
-                            chain_state_account.info.balance = account.balance;
-                            chain_state_account.info.nonce = account.nonce;
-                            chain_state_account.info.code_hash = account.code_hash;
-                            chain_state_account.info.code = account.code;
-                        } else {
-                            accounts.remove(&address);
+                            chain_state_account.info.balance = account.info.balance;
+                            chain_state_account.info.nonce = account.info.nonce;
+                            chain_state_account.info.code_hash = account.info.code_hash;
+                            chain_state_account.info.code = account.info.code;
                         }
                     }
                     // TODO: Implement our own state root calculation function to remove
