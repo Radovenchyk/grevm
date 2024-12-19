@@ -82,11 +82,10 @@ fn test_execute(
 fn mainnet() {
     if let Ok(block_number) = std::env::var("BLOCK_NUMBER").map(|s| s.parse().unwrap()) {
         // Test a specific block
-        let bytecodes = common::load_bytecodes_from_disk();
         let (env, txs, mut db) = common::load_block_from_disk(block_number);
         if db.bytecodes.is_empty() {
             // Use the global bytecodes if the block doesn't have its own
-            db.bytecodes = bytecodes.clone();
+            db.bytecodes = common::load_bytecodes_from_disk();
         }
         let dump_transition = std::env::var("DUMP_TRANSITION").is_ok();
         test_execute(env, txs, db, dump_transition);
