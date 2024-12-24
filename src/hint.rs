@@ -97,6 +97,7 @@ impl ParallelExecutionHints {
         Self { rw_set: vec![RWSet::new(); txs.len()], txs }
     }
 
+    #[fastrace::trace]
     fn generate_dependency(&self) -> TxDependency {
         let num_txs = self.txs.len();
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();

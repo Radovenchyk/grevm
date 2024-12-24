@@ -5,8 +5,9 @@ pub mod common;
 
 use std::sync::Arc;
 
+use crate::common::execute_revm_sequential;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use grevm::GrevmScheduler;
+use grevm::{Scheduler, StateAsyncCommit};
 
 fn benchmark_mainnet(c: &mut Criterion) {
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
@@ -22,38 +23,23 @@ fn benchmark_mainnet(c: &mut Criterion) {
 
         group.bench_function("Origin Sequential", |b| {
             b.iter(|| {
-                common::execute_revm_sequential(
-                    black_box(db.clone()),
-                    black_box(env.spec_id()),
-                    black_box(env.env.as_ref().clone()),
-                    black_box(&*txs),
-                )
+                execute_revm_sequential(db.clone(), env.spec_id(), env.env.as_ref().clone(), &*txs)
+                    .unwrap();
             })
         });
 
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
-                let mut executor = GrevmScheduler::new(
+                let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
+                let mut executor = Scheduler::new(
                     black_box(env.spec_id()),
                     black_box(env.env.as_ref().clone()),
-                    black_box(db.clone()),
                     black_box(txs.clone()),
-                    None,
-                );
-                executor.parallel_execute()
-            })
-        });
-
-        group.bench_function("Grevm Sequential", |b| {
-            b.iter(|| {
-                let mut executor = GrevmScheduler::new(
-                    black_box(env.spec_id()),
-                    black_box(env.env.as_ref().clone()),
                     black_box(db.clone()),
-                    black_box(txs.clone()),
-                    None,
+                    black_box(commiter),
+                    true,
                 );
-                executor.force_sequential_execute()
+                executor.parallel_execute(None).unwrap();
             })
         });
     });

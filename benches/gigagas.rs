@@ -9,13 +9,16 @@ pub mod erc20;
 #[path = "../tests/uniswap/mod.rs"]
 pub mod uniswap;
 
-use crate::{erc20::erc20_contract::ERC20Token, uniswap::contract::SingleSwap};
+use crate::{
+    common::execute_revm_sequential, erc20::erc20_contract::ERC20Token,
+    uniswap::contract::SingleSwap,
+};
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use fastrace::{collector::Config, prelude::*};
 use fastrace_jaeger::JaegerReporter;
-use grevm::GrevmScheduler;
+use grevm::{Scheduler, StateAsyncCommit};
 use metrics::{SharedString, Unit};
 use metrics_util::{
     debugging::{DebugValue, DebuggingRecorder},
@@ -55,66 +58,32 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let txs = Arc::new(txs);
 
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
-    let mut num_iter: usize = 0;
-    let mut execution_time_ns: u64 = 0;
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
-            num_iter += 1;
             let recorder = DebuggingRecorder::new();
             let root = Span::root(format!("{name} Grevm Parallel"), SpanContext::random());
             let _guard = root.set_local_parent();
             metrics::with_local_recorder(&recorder, || {
-                let mut executor = GrevmScheduler::new(
+                let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
+                let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),
                     black_box(env.clone()),
-                    black_box(db.clone()),
                     black_box(txs.clone()),
-                    None,
+                    black_box(db.clone()),
+                    black_box(commiter),
+                    true,
                 );
-                let _ = executor.parallel_execute();
-
-                let snapshot = recorder.snapshotter().snapshot().into_hashmap();
-                execution_time_ns +=
-                    get_metrics_counter_value(&snapshot, "grevm.parallel_execute_time");
-                execution_time_ns += get_metrics_counter_value(&snapshot, "grevm.validate_time");
+                executor.parallel_execute(None).unwrap();
             });
         })
     });
-    println!(
-        "{} Grevm Parallel average execution time: {:.2} ms",
-        name,
-        execution_time_ns as f64 / num_iter as f64 / 1000000.0
-    );
 
-    let mut num_iter: usize = 0;
-    let mut execution_time_ns: u64 = 0;
-    group.bench_function("Grevm Sequential", |b| {
+    group.bench_function("Origin Sequential", |b| {
         b.iter(|| {
-            num_iter += 1;
-            let recorder = DebuggingRecorder::new();
-            let root = Span::root(format!("{name} Grevm Sequential"), SpanContext::random());
-            let _guard = root.set_local_parent();
-            metrics::with_local_recorder(&recorder, || {
-                let mut executor = GrevmScheduler::new(
-                    black_box(SpecId::LATEST),
-                    black_box(env.clone()),
-                    black_box(db.clone()),
-                    black_box(txs.clone()),
-                    None,
-                );
-                let _ = executor.force_sequential_execute();
-
-                let snapshot = recorder.snapshotter().snapshot().into_hashmap();
-                execution_time_ns +=
-                    get_metrics_counter_value(&snapshot, "grevm.sequential_execute_time");
-            });
+            let _ =
+                execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), &*txs).unwrap();
         })
     });
-    println!(
-        "{} Grevm Sequential average execution time: {:.2} ms",
-        name,
-        execution_time_ns as f64 / num_iter as f64 / 1000000.0
-    );
 
     group.finish();
 }
