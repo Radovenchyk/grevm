@@ -19,7 +19,10 @@ use std::{
     },
     thread,
 };
-use tokio::time::Instant;
+use std::cmp::max;
+use std::sync::RwLock;
+use std::time::Instant;
+use crate::queue::LockFreeQueue;
 
 pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
@@ -40,7 +43,7 @@ where
     db: DB,
     commiter: Mutex<C>,
     cache: CachedStorageData,
-    tx_states: Vec<Mutex<TxState>>,
+    tx_states: Vec<RwLock<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
     tx_dependency: Mutex<TxDependency>,
 
@@ -61,7 +64,7 @@ where
     fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128> {
         // register miner accumulator
         if to > 0 {
-            if self.tx_states[to - 1].lock().unwrap().status != TransactionStatus::Finality {
+            if self.tx_states[to - 1].read().unwrap().status != TransactionStatus::Finality {
                 return None;
             }
         }
@@ -108,7 +111,7 @@ where
             db,
             commiter: Mutex::new(commiter),
             cache: CachedStorageData::new(),
-            tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
+            tx_states: (0..num_txs).map(|_| RwLock::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
             tx_dependency: Mutex::new(tx_dependency),
             mv_memory: MVMemory::new(),
@@ -119,29 +122,29 @@ where
         }
     }
 
-    fn async_commit(&self, commit_notifier: &(Mutex<bool>, Condvar)) {
+    fn async_commit(&self) {
         let mut num_commit = 0;
-        while !self.abort.load(Ordering::Acquire) && num_commit < self.block_size {
-            {
-                let mut ready = commit_notifier.0.lock().unwrap();
-                while !*ready {
-                    ready = commit_notifier.1.wait(ready).unwrap();
+        while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
+            let finality_idx= self.finality_idx.load(Ordering::Relaxed);
+            if num_commit == finality_idx {
+                thread::yield_now();
+            } else {
+                while num_commit < finality_idx {
+                    let result = self.tx_results[num_commit]
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .execute_result
+                        .clone();
+                    let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
+                    self.commiter.lock().unwrap().commit(result, &self.cache);
+                    // println!("commit tx: {}", num_commit);
+                    num_commit += 1;
                 }
             }
-            while num_commit < self.finality_idx.load(Ordering::Acquire) {
-                let result = self.tx_results[num_commit]
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .execute_result
-                    .clone();
-                let Ok(result) = result else { panic!("Commit error transaction") };
-                self.commiter.lock().unwrap().commit(result, &self.cache);
-                num_commit += 1;
-            }
-            *commit_notifier.0.lock().unwrap() = false;
         }
+        // println!("finish commit {} txs", self.block_size);
     }
 
     pub fn with_commiter<F, R>(&self, func: F) -> R
@@ -157,11 +160,14 @@ where
         concurrency_level: Option<usize>,
     ) -> Result<(), EVMError<DB::Error>> {
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let lock = Mutex::new(());
         let commit_notifier = (Mutex::new(false), Condvar::new());
+        let task_queue = LockFreeQueue::new(concurrency_level * 2);
         thread::scope(|scope| {
             scope.spawn(|| {
-                self.async_commit(&commit_notifier);
+                self.async_commit();
+            });
+            scope.spawn(|| {
+                self.assign_tasks(&task_queue);
             });
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
@@ -177,29 +183,21 @@ where
                         .with_spec_id(self.spec_id.clone())
                         .with_env(Box::new(self.env.clone()))
                         .build();
-                    loop {
-                        let task = {
-                            let _lock = lock.lock().unwrap();
-                            self.next(&commit_notifier)
-                        };
-                        if let Some(task) = task {
-                            match task {
-                                Task::Execution(tx_version) => {
-                                    self.execute(&mut evm, tx_version);
-                                }
-                                Task::Validation(tx_version) => {
-                                    self.validate(tx_version);
-                                }
+                    while let Some(task) = self.next(&task_queue) {
+                        match task {
+                            Task::Execution(tx_version) => {
+                                self.execute(&mut evm, tx_version);
                             }
-                        } else {
-                            break;
+                            Task::Validation(tx_version) => {
+                                self.validate(tx_version);
+                            }
                         }
                     }
                 });
             }
         });
-        if self.abort.load(Ordering::Acquire) {
-            let result = self.tx_results[self.finality_idx.load(Ordering::Acquire)].lock().unwrap();
+        if self.abort.load(Ordering::Relaxed) {
+            let result = self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock().unwrap();
             if let Some(result) = result.as_ref() {
                 if let Err(e) = &result.execute_result {
                     return Err(e.clone());
@@ -215,8 +213,9 @@ where
     where
         RA: RewardsAccumulator,
     {
-        let finality_idx = self.finality_idx.load(Ordering::Acquire);
+        let finality_idx = self.finality_idx.load(Ordering::Relaxed);
         let TxVersion { txid, incarnation } = tx_version;
+        // println!("start to execute tx: {}, incarnation: {}", txid, incarnation);
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         *evm.tx_mut() = self.txs[txid].clone();
         let result = evm.transact_lazy_reward();
@@ -244,7 +243,7 @@ where
 
                 // update transaction status
                 {
-                    let mut tx_state = self.tx_states[txid].lock().unwrap();
+                    let mut tx_state = self.tx_states[txid].write().unwrap();
                     if tx_state.incarnation != incarnation {
                         panic!("Inconsistent incarnation when execution");
                     }
@@ -253,17 +252,23 @@ where
                     } else {
                         TransactionStatus::Executed
                     };
+                    // println!("finish execute tx: {}, incarnation: {}, status={:?}", txid, incarnation, tx_state.status);
                 }
 
                 if conflict {
-                    let mut tx_dependency = self.tx_dependency.lock().unwrap();
                     if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        tx_dependency.add(txid, self.finality_idx.load(Ordering::Acquire)..txid);
+                        let dep_txs = self.finality_idx.load(Ordering::Relaxed)..txid;
+                        let mut tx_dependency = self.tx_dependency.lock().unwrap();
+                        tx_dependency.add(txid, dep_txs);
                     } else {
-                        tx_dependency.add(txid, self.generate_dependent_txs(txid, &read_set));
+                        let dep_txs = self.generate_dependent_txs(txid, &read_set);
+                        let mut tx_dependency = self.tx_dependency.lock().unwrap();
+                        tx_dependency.add(txid, dep_txs);
                     }
+                } else {
+                    self.tx_dependency.lock().unwrap().remove(txid);
                 }
                 *last_result = Some(TransactionResult {
                     read_set,
@@ -295,18 +300,20 @@ where
 
                 // update transaction status
                 {
-                    let mut tx_state = self.tx_states[txid].lock().unwrap();
+                    let mut tx_state = self.tx_states[txid].write().unwrap();
                     if tx_state.incarnation != incarnation {
                         panic!("Inconsistent incarnation when execution");
                     }
                     tx_state.status = TransactionStatus::Conflict;
                 }
-                let mut tx_dependency = self.tx_dependency.lock().unwrap();
-                tx_dependency.add(txid, self.generate_dependent_txs(txid, &read_set));
+                {
+                    let dep_txs = self.generate_dependent_txs(txid, &read_set);
+                    self.tx_dependency.lock().unwrap().add(txid, dep_txs);
+                }
                 *last_result =
                     Some(TransactionResult { read_set, write_set, execute_result: Err(e) });
                 if finality_idx == txid {
-                    self.abort.store(true, Ordering::Release);
+                    self.abort.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -323,6 +330,7 @@ where
         if let Err(_) = &result.execute_result {
             panic!("Error transaction should take as conflict before validating");
         }
+        // println!("start validate tx: {}, incarnation: {}", txid, incarnation);
 
         for (location, version) in result.read_set.iter() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
@@ -352,23 +360,24 @@ where
 
         // update transaction status
         {
-            let mut tx_state = self.tx_states[txid].lock().unwrap();
+            let mut tx_state = self.tx_states[txid].write().unwrap();
             if tx_state.incarnation != incarnation {
                 panic!("Inconsistent incarnation when validating");
             }
             tx_state.status =
                 if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
+            // println!("finish validate tx: {}, incarnation: {}, status={:?}", txid, incarnation, tx_state.status);
         }
 
         if conflict {
+            // mark write set as estimate
+            self.mark_estimate(txid, incarnation, &result.write_set);
             // update dependency
+            let dep_txs = self.generate_dependent_txs(txid, &result.read_set);
             self.tx_dependency
                 .lock()
                 .unwrap()
-                .add(txid, self.generate_dependent_txs(txid, &result.read_set));
-
-            // mark write set as estimate
-            self.mark_estimate(txid, incarnation, &result.write_set);
+                .add(txid, dep_txs);
         }
     }
 
@@ -396,7 +405,7 @@ where
                 // written_transactions
                 if let Some((dep_id, _)) = written_transactions.range(..txid).next_back() {
                     let dep_id = *dep_id;
-                    if dep_id > self.finality_idx.load(Ordering::Acquire) {
+                    if dep_id > self.finality_idx.load(Ordering::Relaxed) {
                         dep_ids.insert(dep_id);
                     }
                 }
@@ -405,88 +414,134 @@ where
         dep_ids
     }
 
-    pub fn next(&self, commit_notifier: &(Mutex<bool>, Condvar)) -> Option<Task> {
+    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
         let mut start = Instant::now();
-        while self.finality_idx.load(Ordering::Acquire) < self.block_size &&
-            !self.abort.load(Ordering::Acquire)
-        {
-            // Confirm the finality and conflict status
-            while self.finality_idx.load(Ordering::Acquire) <
-                self.validation_idx.load(Ordering::Acquire)
-            {
-                let mut tx =
-                    self.tx_states[self.finality_idx.load(Ordering::Acquire)].lock().unwrap();
-                match tx.status {
-                    TransactionStatus::Unconfirmed => {
-                        tx.status = TransactionStatus::Finality;
-                        let txid = self.finality_idx.fetch_add(1, Ordering::Release);
-                        self.tx_dependency.lock().unwrap().remove(txid);
-                        let mut ready = commit_notifier.0.lock().unwrap();
-                        *ready = true;
-                        commit_notifier.1.notify_one();
+        let capacity = task_queue.capacity();
+        let threshold = capacity / 2;
+        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
+            !self.abort.load(Ordering::Relaxed) {
+            let remaining_tasks = task_queue.len();
+            if remaining_tasks < threshold {
+                let num_tasks = capacity - remaining_tasks;
+                let mut batch_task = Vec::with_capacity(num_tasks);
+                let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
+                let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
+                let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
+                // Confirm the finality and conflict status
+                if finality_idx < validation_idx {
+                    while finality_idx < validation_idx {
+                        let tx_status =
+                            self.tx_states[finality_idx].read().unwrap().status.clone();
+                        match tx_status {
+                            TransactionStatus::Unconfirmed => {
+                                self.tx_states[finality_idx].write().unwrap().status = TransactionStatus::Finality;
+                                // println!("finality tx: {}", finality_idx);
+                                finality_idx += 1;
+                            }
+                            TransactionStatus::Conflict | TransactionStatus::Executed => {
+                                // Subsequent transactions after conflict need to be revalidated
+                                validation_idx = finality_idx;
+                                // println!("change validation cursor tx: {}, status={:?}", finality_idx, tx_status);
+                                break;
+                            }
+                            _ => {
+                                // println!("break tx: {}, status={:?}", finality_idx, tx_status);
+                                break;
+                            }
+                        }
                     }
-                    TransactionStatus::Conflict | TransactionStatus::Executed => {
-                        // Subsequent transactions after conflict need to be revalidated
-                        self.validation_idx
-                            .store(self.finality_idx.load(Ordering::Acquire), Ordering::Release);
-                        break;
-                    }
-                    _ => {
+                    self.finality_idx.store(finality_idx, Ordering::Release);
+                }
+
+                // Prior to submit validation task
+                while batch_task.len() < num_tasks {
+                    if validation_idx < execution_idx {
+                        let mut tx = self.tx_states[validation_idx].write().unwrap();
+                        if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
+                        {
+                            tx.status = TransactionStatus::Validating;
+                            batch_task.push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
+                            // println!("submit validation tx: {}", validation_idx);
+                            validation_idx += 1;
+                        } else {
+                            // println!("skip submit validation tx: {}, status={:?}", validation_idx, tx.status);
+                            break;
+                        }
+                    } else {
                         break;
                     }
                 }
-            }
-            // Prior to submit validation task
-            while self.validation_idx.load(Ordering::Acquire) <
-                self.execution_idx.load(Ordering::Acquire)
-            {
-                let validation_idx = self.validation_idx.load(Ordering::Acquire);
-                let mut tx = self.tx_states[validation_idx].lock().unwrap();
-                if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
-                {
-                    self.validation_idx.fetch_add(1, Ordering::Release);
-                    tx.status = TransactionStatus::Validating;
-                    return Some(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
+                self.validation_idx.store(validation_idx, Ordering::Release);
+
+                // Submit execution task
+                while batch_task.len() < num_tasks {
+                    let mut tx_dependency = self.tx_dependency.lock().unwrap();
+                    if let Some((tasks, continuous_id)) = tx_dependency.next(num_tasks - batch_task.len()) {
+                        // println!("get execution task: {:?}", tasks);
+                        for execute_id in tasks.into_iter() {
+                            let mut tx = self.tx_states[execute_id].write().unwrap();
+                            if !matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+                                // println!("start skip submit execution tx: {}, status={:?}", execute_id, tx.status);
+                                tx_dependency.remove(execute_id);
+                                // println!("finish skip submit execution tx: {}, and remove", execute_id);
+                                continue;
+                            }
+                            execution_idx = max(execution_idx, continuous_id);
+                            // println!("submit execution tx: {}, continuous_id={}", execute_id, continuous_id);
+                            tx.status = TransactionStatus::Executing;
+                            tx.incarnation += 1;
+                            batch_task.push(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.execution_idx.store(execution_idx, Ordering::Release);
+
+                if batch_task.is_empty() {
+                    thread::yield_now();
+                    if (Instant::now() - start).as_millis() > 8_000 {
+                        start = Instant::now();
+                        println!(
+                            "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                            self.finality_idx.load(Ordering::Acquire),
+                            self.validation_idx.load(Ordering::Acquire),
+                            self.execution_idx.load(Ordering::Acquire)
+                        );
+                        let status: Vec<(TxId, TransactionStatus)> = self
+                            .tx_states
+                            .iter()
+                            .map(|s| s.read().unwrap().status.clone())
+                            .enumerate()
+                            .collect();
+                        println!("transaction status: {:?}", status);
+                        self.tx_dependency.lock().unwrap().print();
+                        println!("task queue size: {}", task_queue.len());
+                    }
                 } else {
-                    break;
+                    // println!("assign tasks: {:?}", batch_task);
+                    for task in batch_task.into_iter() {
+                        task_queue.push(task).expect("Failed to assign task");
+                    }
                 }
-            }
-            // Submit execution task
-            let mut tx_dependency = self.tx_dependency.lock().unwrap();
-            while let Some(execute_id) = tx_dependency.next() {
-                let mut tx = self.tx_states[execute_id].lock().unwrap();
-                if !matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
-                    tx_dependency.remove(execute_id);
-                    continue;
-                }
-                self.execution_idx.fetch_max(execute_id + 1, Ordering::Release);
-                tx.status = TransactionStatus::Executing;
-                tx.incarnation += 1;
-                return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
-            }
-            thread::yield_now();
-            if (Instant::now() - start).as_millis() > 4_000 {
-                start = Instant::now();
-                let execute_idx = self.execution_idx.load(Ordering::Acquire);
-                println!(
-                    "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                    self.finality_idx.load(Ordering::Acquire),
-                    self.validation_idx.load(Ordering::Acquire),
-                    execute_idx
-                );
-                let status: Vec<(TxId, TransactionStatus)> = self
-                    .tx_states
-                    .iter()
-                    .map(|s| s.lock().unwrap().status.clone())
-                    .enumerate()
-                    .collect();
-                println!("transaction status: {:?}", status);
-                tx_dependency.print();
+            } else {
+                thread::yield_now();
             }
         }
-        let mut ready = commit_notifier.0.lock().unwrap();
-        *ready = true;
-        commit_notifier.1.notify_one();
+    }
+
+    pub fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
+        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
+            !self.abort.load(Ordering::Relaxed)
+        {
+            if let Some(task) = task_queue.pop() {
+                // println!("next task: {:?}", task);
+                return Some(task);
+            } else {
+                thread::yield_now();
+            }
+        }
+        // println!("finish submit next task");
         None
     }
 }

@@ -3,6 +3,7 @@ mod hint;
 mod scheduler;
 mod storage;
 mod tx_dependency;
+mod queue;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
@@ -96,9 +97,16 @@ struct TransactionResult<DBError> {
     pub execute_result: EVMResult<DBError>,
 }
 
+#[derive(Clone, Debug)]
 enum Task {
     Execution(TxVersion),
     Validation(TxVersion),
+}
+
+impl Default for Task {
+    fn default() -> Self {
+        Task::Execution(TxVersion::new(0, 0))
+    }
 }
 
 /// Utility function for parallel execution using fork-join pattern.
